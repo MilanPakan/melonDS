@@ -43,6 +43,11 @@ bool enabled = false, initDone = false;
 int sock = -1;
 sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
 State me{}, peer{}; bool havePeer = false;
+// Co-op trainerbattle (bench/hgtpatch.py): de ROM-hook zet HGT.signal = trainerId op kSignal; wij sturen dat als
+// BattleMsg naar de ander, die daarop het joiner-script (HGT_JOIN_SCRIPT, standaard 9019) injecteert via de mailbox.
+struct BattleMsg { char tag[4]; uint32_t trainer; };
+const uint32_t kSignal = 0x02078B04;
+BattleMsg peerBattle{}; uint32_t peerBattleSeen = 0, lastJoin = 0;
 uint32_t frame = 0, peerSeen = 0;
 std::string dumpDir;
 
@@ -94,10 +99,11 @@ void init()
 void exchange()
 {
     if (peerLen) sendto(sock, (const char*)&me, sizeof(me), 0, (sockaddr*)&peerAddr, peerLen);
-    State in{}; sockaddr_storage from{}; socklen_t fromLen = sizeof(from);
-    while (recvfrom(sock, (char*)&in, sizeof(in), 0, (sockaddr*)&from, &fromLen) == (int)sizeof(in))
+    char buf[64]; sockaddr_storage from{}; socklen_t fromLen = sizeof(from); int n;
+    while ((n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen)) > 0)
     {
-        peer = in; havePeer = true; peerSeen = frame;
+        if (n == (int)sizeof(State)) { memcpy(&peer, buf, sizeof(State)); havePeer = true; peerSeen = frame; }
+        else if (n == (int)sizeof(BattleMsg) && memcmp(buf, "HGTB", 4) == 0) { memcpy(&peerBattle, buf, sizeof(BattleMsg)); peerBattleSeen = frame; }
         if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; }   // peer onbekend: antwoord naar afzender
         fromLen = sizeof(from);
     }
@@ -172,16 +178,22 @@ void callStart(NDS& nds)
 }
 bool callPoll(NDS& nds)   // true = klaar
 {
-    if (!nds.ARM9Read32(kMailbox + 24)) { if (++call.frames == 1800) fprintf(stderr, "HGT: call %08X loopt al 30 s (hook actief?)\n", call.addr); return false; }
+    if (!nds.ARM9Read32(kMailbox + 24))
+    {
+        if (++call.frames < 1800) return false;   // na 30 s opgeven (hook draait niet: geen overworld?) zodat de wachtrij doorloopt
+        fprintf(stderr, "HGT: call %08X TIMEOUT (hook actief?)\n", call.addr); nds.ARM9Write32(kMailbox, 0);
+        std::string tmp = call.out + ".tmp"; FILE* f = call.out.empty() ? nullptr : fopen(tmp.c_str(), "w"); if (f) { fprintf(f, "TIMEOUT\n"); fclose(f); rename(tmp.c_str(), call.out.c_str()); }
+        call.active = false; return true;
+    }
     u32 r0 = nds.ARM9Read32(kMailbox + 20); nds.ARM9Write32(kMailbox + 24, 0);
-    std::string tmp = call.out + ".tmp"; FILE* f = fopen(tmp.c_str(), "w");
+    std::string tmp = call.out + ".tmp"; FILE* f = call.out.empty() ? nullptr : fopen(tmp.c_str(), "w");
     if (f) { fprintf(f, "%08X\n", r0); fclose(f); rename(tmp.c_str(), call.out.c_str()); }
     fprintf(stderr, "HGT: call %08X -> r0=%08X (f%u)\n", call.addr, r0, call.frames);
     call.active = false; return true;
 }
 bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
 {
-    if (ctlFd < 0) return false;
+    if (ctlFd < 0) { if (call.active) callPoll(nds); else if (call.pending) callStart(nds); return false; }
     ctlPoll();
     if (call.active && !callPoll(nds)) return false;
     if (call.pending) { callStart(nds); return false; }
@@ -248,7 +260,12 @@ void applyPokes(NDS& nds)
     for (const Poke& pk : pokes)
     {
         std::vector<u8> nw = hexBytes(pk.newHex);
-        if (pk.oldHex.empty()) { if (frame != 3) continue; }
+        // zonder OLD: elk frame schrijven tot frame 1200, zodat de bytes ook een koude boot overleven (arm9 wordt pas
+        // na de logo's uit de ROM geladen); daarna niet meer, zodat de mailbox vrij blijft
+        // (vanaf frame 240: de arm9 van HG pakt zichzelf in de eerste frames uit, eerder schrijven geeft een wit scherm)
+        if (pk.oldHex.empty()) { if (frame < 240 || frame > 1200) continue; bool same = true;
+            for (size_t i = 0; i < nw.size() && same; i++) same = nds.ARM9Read8(pk.addr + i) == nw[i];
+            if (same) continue; }
         else { std::vector<u8> old = hexBytes(pk.oldHex); bool match = true;
             for (size_t i = 0; i < old.size() && match; i++) match = nds.ARM9Read8(pk.addr + i) == old[i];
             if (!match) continue; }
@@ -295,10 +312,27 @@ void HGTogether::tick(EmuInstance* emu)
     if (!enabled || !emu->nds) return;
     frame++;
     if (frame == 1) startLan(emu);
-    if (frame == 2) if (const char* st = getenv("HGT_LOADSTATE")) fprintf(stderr, "HGT: savestate %s %s\n", st, emu->loadState(st) ? "geladen" : "MISLUKT");
+    if (frame == 2) if (const char* st = getenv("HGT_LOADSTATE")) if (*st) fprintf(stderr, "HGT: savestate %s %s\n", st, emu->loadState(st) ? "geladen" : "MISLUKT");
     NDS& nds = *emu->nds;
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
     if (frame % 30 == 0) logBattle(nds);
+    uint32_t t = frame > 300 ? nds.ARM9Read32(kSignal) : 0;   // pas na de pokes (frame 240+), anders lezen we Wi-Fi-code
+    if (t)   // ROM-hook: trainerbattle gestart, ander moet joinen
+    {
+        BattleMsg m{ {'H','G','T','B'}, t }; nds.ARM9Write32(kSignal, 0);
+        for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen);
+        fprintf(stderr, "HGT: trainerbattle %u -> sein naar de ander\n", t);
+    }
+    if (peerBattleSeen && frame - peerBattleSeen < 2 && frame - lastJoin > 600 && !call.active && !call.pending)
+    {
+        uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0;
+        if (inRam(fs))
+        {
+            const char* js = getenv("HGT_JOIN_SCRIPT");
+            call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = js ? atoi(js) : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true; lastJoin = frame;
+            fprintf(stderr, "HGT: ander start trainerbattle %u -> joiner-script %u\n", peerBattle.trainer, call.a[1]);
+        }
+    }
     bool haveMe = readState(nds, me); me.frame = frame;
     if (haveMe) exchange();
     void* top = nullptr; void* bottom = nullptr;
