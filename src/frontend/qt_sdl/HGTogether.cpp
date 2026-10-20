@@ -7,10 +7,15 @@
 #include "EmuInstance.h"
 #include "NDS.h"
 #include "GPU.h"
+#include "Config.h"
+#include "net/MPInterface.h"
+#include "net/LAN.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <deque>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -125,13 +130,150 @@ void dump(const u32* fb)
 }
 }
 
+// HGT_CTL=<fifo>: stuurkanaal voor tests zonder mens. Regels: "k MASK N" (toetsen MASK = bits A1 B2 Sel4 St8 R16 L32 U64 D128
+// R256 L512 X1024 Y2048, N frames vast), "t X Y N" (touch N frames), "w N" (wachten), "s PAD" (screenshot boven+onder
+// als 256x384 PPM), "r ADDR LEN PAD" (hex-dump RAM). Commando's lopen op volgorde, één tegelijk.
+int ctlFd = -1; std::string ctlBuf; std::deque<std::string> ctlQ; u32 ctlKeys = 0, ctlFrames = 0; int ctlTouchX = -1, ctlTouchY = -1;
+void ctlPoll()
+{
+    if (ctlFd < 0) return;
+    char b[1024]; ssize_t n;
+    while ((n = read(ctlFd, b, sizeof(b))) > 0) ctlBuf.append(b, n);
+    size_t nl;
+    while ((nl = ctlBuf.find('\n')) != std::string::npos) { ctlQ.push_back(ctlBuf.substr(0, nl)); ctlBuf.erase(0, nl + 1); }
+}
+void ctlShot(NDS& nds, const char* path)
+{
+    void* top = nullptr; void* bottom = nullptr;
+    if (!nds.GPU.GetFramebuffers(&top, &bottom) || !top || !bottom) return;
+    std::string tmp = std::string(path) + ".tmp"; FILE* f = fopen(tmp.c_str(), "wb"); if (!f) return;
+    fprintf(f, "P6\n256 384\n255\n");
+    for (const u32* fb : { (const u32*)top, (const u32*)bottom })
+        for (int i = 0; i < 256 * 192; i++) { unsigned char px[3] = { (unsigned char)(fb[i] >> 16), (unsigned char)(fb[i] >> 8), (unsigned char)fb[i] }; fwrite(px, 1, 3, f); }
+    fclose(f); rename(tmp.c_str(), path);
+}
+void ctlRead(NDS& nds, u32 addr, u32 len, const char* path)
+{
+    std::string tmp = std::string(path) + ".tmp"; FILE* f = fopen(tmp.c_str(), "w"); if (!f) return;
+    for (u32 i = 0; i < len; i++) fprintf(f, "%02X", nds.ARM9Read8(addr + i));
+    fprintf(f, "\n"); fclose(f); rename(tmp.c_str(), path);
+}
+bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
+{
+    if (ctlFd < 0) return false;
+    ctlPoll();
+    while (ctlFrames == 0 && !ctlQ.empty())
+    {
+        std::string l = ctlQ.front(); ctlQ.pop_front();
+        char c = l.empty() ? 0 : l[0]; const char* a = l.c_str() + 1;
+        u32 x = 0, y = 0, n = 0; char path[512] = {0};
+        ctlTouchX = ctlTouchY = -1; ctlKeys = 0;
+        if (c == 'k' && sscanf(a, "%u %u", &x, &n) == 2) { ctlKeys = x; ctlFrames = n; }
+        else if (c == 't' && sscanf(a, "%u %u %u", &x, &y, &n) == 3) { ctlTouchX = x; ctlTouchY = y; ctlFrames = n; }
+        else if (c == 'w' && sscanf(a, "%u", &n) == 1) ctlFrames = n;
+        else if (c == 's' && sscanf(a, "%511s", path) == 1) ctlShot(nds, path);
+        else if (c == 'r' && sscanf(a, "%x %u %511s", &x, &n, path) == 3) ctlRead(nds, x, n, path);
+        else if (!l.empty()) fprintf(stderr, "HGT: ctl '%s' ongeldig\n", l.c_str());
+    }
+    if (ctlFrames == 0) return false;
+    ctlFrames--;
+    nds.SetKeyMask(0xFFF & ~ctlKeys);
+    if (ctlTouchX >= 0) nds.TouchScreen(ctlTouchX, ctlTouchY); else nds.ReleaseScreen();
+    return true;
+}
+
+bool HGTogether::input(EmuInstance* emu)
+{
+    if (ctlFd == -2 || !emu->nds) return false;
+    if (ctlFd == -1) { const char* p = getenv("HGT_CTL"); ctlFd = (p && *p) ? open(p, O_RDONLY | O_NONBLOCK) : -2; if (p && *p) fprintf(stderr, "HGT: ctl %s %s\n", p, ctlFd >= 0 ? "open" : "MISLUKT"); }
+    return ctlStep(*emu->nds);
+}
+
+// HGT_POKES="020514B8=0FE0;0223E6D2=A9>A8": bytes in RAM overschrijven (ROM-code patchen voor fase 4-experimenten).
+// "ADDR=NEW" schrijft één keer (frame 3, arm9 staat dan vast); "ADDR=OLD>NEW" schrijft elk frame zodra er OLD staat,
+// nodig voor overlays (bv. battle-overlay 12) die het spel later laadt en daarmee onze bytes overschrijft.
+struct Poke { uint32_t addr; std::string oldHex, newHex; };
+std::vector<Poke> pokes; bool pokesParsed = false;
+std::vector<u8> hexBytes(const std::string& h) { std::vector<u8> v; for (size_t i = 0; i + 1 < h.size(); i += 2) v.push_back((u8)strtoul(h.substr(i, 2).c_str(), nullptr, 16)); return v; }
+void parsePokes()
+{
+    pokesParsed = true; const char* env = getenv("HGT_POKES"); if (!env) return;
+    std::string all(env);
+    for (size_t p = 0; p < all.size();)
+    {
+        size_t e = all.find(';', p); if (e == std::string::npos) e = all.size();
+        std::string tok = all.substr(p, e - p); p = e + 1;
+        size_t eq = tok.find('='), gt = tok.find('>');
+        Poke pk{}; if (eq != std::string::npos) { pk.addr = strtoul(tok.substr(0, eq).c_str(), nullptr, 16);
+            pk.newHex = tok.substr(gt == std::string::npos ? eq + 1 : gt + 1); if (gt != std::string::npos) pk.oldHex = tok.substr(eq + 1, gt - eq - 1); }
+        bool ok = eq != std::string::npos && inRam(pk.addr) && !pk.newHex.empty() && pk.newHex.size() % 2 == 0 && (pk.oldHex.empty() || pk.oldHex.size() == pk.newHex.size());
+        if (!ok) { fprintf(stderr, "HGT: poke '%s' ongeldig\n", tok.c_str()); continue; }
+        pokes.push_back(pk);
+    }
+}
+void applyPokes(NDS& nds)
+{
+    if (!pokesParsed) parsePokes();
+    if (frame % 600 == 0) for (const Poke& pk : pokes)   // read-back ter controle (elke 10 s)
+    {
+        std::string cur; char b[3];
+        for (size_t i = 0; i < pk.newHex.size() / 2; i++) { snprintf(b, sizeof(b), "%02X", nds.ARM9Read8(pk.addr + i)); cur += b; }
+        fprintf(stderr, "HGT: poke-check %08X = %s (gewenst %s)\n", pk.addr, cur.c_str(), pk.newHex.c_str());
+    }
+    for (const Poke& pk : pokes)
+    {
+        std::vector<u8> nw = hexBytes(pk.newHex);
+        if (pk.oldHex.empty()) { if (frame != 3) continue; }
+        else { std::vector<u8> old = hexBytes(pk.oldHex); bool match = true;
+            for (size_t i = 0; i < old.size() && match; i++) match = nds.ARM9Read8(pk.addr + i) == old[i];
+            if (!match) continue; }
+        for (size_t i = 0; i < nw.size(); i++) nds.ARM9Write8(pk.addr + i, nw[i]);
+        fprintf(stderr, "HGT: poke %08X <- %s (f%u)\n", pk.addr, pk.newHex.c_str(), frame);
+    }
+}
+
+// HGT_LAN="host:NAAM:2" of "join:NAAM:ADRES": melonDS-LAN-multiplayer starten (losse processen/pc's zien elkaar niet via
+// LocalMP, dat werkt alleen binnen één proces). De DS-wireless loopt dan over LAN; de joiner start na de host.
+void startLan(EmuInstance* emu)
+{
+    const char* env = getenv("HGT_LAN"); if (!env) return;
+    std::string spec(env); size_t a = spec.find(':'), b = spec.find(':', a + 1);
+    if (a == std::string::npos || b == std::string::npos) { fprintf(stderr, "HGT: HGT_LAN moet host:NAAM:N of join:NAAM:ADRES zijn\n"); return; }
+    std::string mode = spec.substr(0, a), name = spec.substr(a + 1, b - a - 1), arg = spec.substr(b + 1);
+    // niet setMPInterface(): die werkt Qt-menu's bij en dit draait op de emu-thread
+    melonDS::MPInterface::Set(melonDS::MPInterface_LAN);
+    melonDS::MPInterface::Get().SetRecvTimeout(Config::GetGlobalTable().GetInt("MP.RecvTimeout"));
+    melonDS::LAN& lan = (melonDS::LAN&)melonDS::MPInterface::Get();
+    bool ok = mode == "host" ? lan.StartHost(name.c_str(), atoi(arg.c_str())) : lan.StartClient(name.c_str(), arg.c_str());
+    lan.Begin(emu->getInstanceID());
+    fprintf(stderr, "HGT: LAN %s als %s: %s\n", mode.c_str(), name.c_str(), ok ? "gestart" : "MISLUKT");
+}
+
+// Logt één keer per battle het echte battleType + trainer-ids: FieldSystem->processManager->child (battle-app)->args = BattleSetup.
+uint32_t lastSetup = 0;
+void logBattle(NDS& nds)
+{
+    uint32_t var = nds.ARM9Read32(kFieldSysLiteral); if (!inRam(var)) return;
+    uint32_t fs = nds.ARM9Read32(var);               if (!inRam(fs)) return;
+    uint32_t pm = nds.ARM9Read32(fs);                if (!inRam(pm)) return;
+    uint32_t child = nds.ARM9Read32(pm + 4);
+    if (!inRam(child)) { lastSetup = 0; return; }
+    uint32_t setup = nds.ARM9Read32(child + 0x18);   if (!inRam(setup) || setup == lastSetup) return;
+    lastSetup = setup;
+    fprintf(stderr, "HGT: battle setup=%08X type=%08X trainers=%u,%u,%u,%u mode=%u\n", setup, nds.ARM9Read32(setup),
+            nds.ARM9Read32(setup + 0x18), nds.ARM9Read32(setup + 0x1C), nds.ARM9Read32(setup + 0x20), nds.ARM9Read32(setup + 0x24), nds.ARM9Read8(setup + 0x1B2));
+}
+
 void HGTogether::tick(EmuInstance* emu)
 {
     if (!initDone) init();
     if (!enabled || !emu->nds) return;
     frame++;
+    if (frame == 1) startLan(emu);
     if (frame == 2) if (const char* st = getenv("HGT_LOADSTATE")) fprintf(stderr, "HGT: savestate %s %s\n", st, emu->loadState(st) ? "geladen" : "MISLUKT");
     NDS& nds = *emu->nds;
+    if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
+    if (frame % 30 == 0) logBattle(nds);
     bool haveMe = readState(nds, me); me.frame = frame;
     if (haveMe) exchange();
     void* top = nullptr; void* bottom = nullptr;

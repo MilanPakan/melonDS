@@ -1749,12 +1749,15 @@ void EmuInstance::customizeFirmware(Firmware& firmware, bool overridesettings) n
         }
     }
 
-    if (instanceID > 0)
+    // HG-Together: HGT_INSTANCE=n geeft een los proces hetzelfde unieke MAC als in-proces instance n (nodig voor LAN-MP).
+    int macInstance = instanceID;
+    if (const char* s = getenv("HGT_INSTANCE")) macInstance = atoi(s);
+    if (macInstance > 0)
     {
         rep = true;
-        mac[3] += instanceID;
-        mac[4] += instanceID*0x44;
-        mac[5] += instanceID*0x10;
+        mac[3] += macInstance;
+        mac[4] += macInstance*0x44;
+        mac[5] += macInstance*0x10;
     }
 
     if (rep)

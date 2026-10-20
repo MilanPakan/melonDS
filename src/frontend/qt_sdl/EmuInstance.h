@@ -82,7 +82,7 @@ bool isRightModKey(QKeyEvent* event);
 int getEventKeyVal(QKeyEvent* event);
 
 class EmuInstance;
-namespace HGTogether { void tick(EmuInstance*); }
+namespace HGTogether { void tick(EmuInstance*); bool input(EmuInstance*); }
 
 class EmuInstance
 {
@@ -383,6 +383,7 @@ private:
 
     friend class EmuThread;
     friend void HGTogether::tick(EmuInstance*);
+    friend bool HGTogether::input(EmuInstance*);
     friend class MainWindow;
 };
 
