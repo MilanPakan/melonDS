@@ -81,6 +81,9 @@ enum
 bool isRightModKey(QKeyEvent* event);
 int getEventKeyVal(QKeyEvent* event);
 
+class EmuInstance;
+namespace HGTogether { void tick(EmuInstance*); }
+
 class EmuInstance
 {
 public:
@@ -379,6 +382,7 @@ private:
     melonDS::u16 touchX, touchY;
 
     friend class EmuThread;
+    friend void HGTogether::tick(EmuInstance*);
     friend class MainWindow;
 };
 

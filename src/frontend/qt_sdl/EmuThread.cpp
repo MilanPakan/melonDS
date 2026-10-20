@@ -52,6 +52,7 @@
 #include "GPU_OpenGL.h"
 
 #include "Savestate.h"
+#include "HGTogether.h"
 
 #include "EmuInstance.h"
 
@@ -310,6 +311,7 @@ void EmuThread::run()
             {
                 nlines = emuInstance->nds->RunFrame();
             }
+            HGTogether::tick(emuInstance);
 
             if (emuInstance->ndsSave)
                 emuInstance->ndsSave->CheckFlush();
