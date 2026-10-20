@@ -73,6 +73,7 @@
 #include "ArchiveUtil.h"
 #include "CameraManager.h"
 #include "Window.h"
+#include "HGTDock.h"
 #include "AboutDialog.h"
 
 using namespace melonDS;
@@ -661,6 +662,8 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
 
     panel = nullptr;
     createScreenPanel();
+    if (getenv("HGT_PORT"))   // HG-Together: Soul Link dock beside the game (docs/soullink.md)
+        addDockWidget(Qt::RightDockWidgetArea, hgtDock = new HGTDock(this, emuInstance, [this] { return QString::fromStdString(emuInstance->baseROMDir + "/" + emuInstance->baseROMName); }));
 
     if (hasMenu)
     {
@@ -2170,6 +2173,7 @@ void MainWindow::toggleFullscreen()
             menuBar()->setFixedHeight(menuBarHeight);
         }
     }
+    if (hgtDock) hgtDock->setVisible(!isFullScreen());
 }
 
 void MainWindow::onFullscreenToggled()

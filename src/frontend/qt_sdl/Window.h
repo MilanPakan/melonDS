@@ -26,6 +26,7 @@
 #include <QWidget>
 #include <QWindow>
 #include <QMainWindow>
+#include <QDockWidget>
 #include <QImage>
 #include <QActionGroup>
 #include <QTimer>
@@ -224,6 +225,7 @@ private:
 
 public:
     ScreenPanel* panel;
+    QDockWidget* hgtDock = nullptr;   // HG-Together Soul Link dock
 
     bool hasMenu;
 
