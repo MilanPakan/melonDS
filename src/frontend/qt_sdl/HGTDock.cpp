@@ -641,7 +641,7 @@ bool readMon(NDS& nds, uint32_t a, Mon& m)
 // One NARC from the player's ROM (FNT walk by path), kept in memory.
 struct Narc
 {
-    std::vector<uint8_t> data; std::vector<std::pair<uint32_t, uint32_t>> fat; uint32_t gmif = 0;
+    std::vector<uint8_t> data; std::vector<std::pair<uint32_t, uint32_t>> fat; uint32_t gmif = 0, base = 0;   // base = ROM offset of the NARC
     static uint32_t u32(const QByteArray& b, int o) { uint32_t v; memcpy(&v, b.constData() + o, 4); return v; }
     static uint16_t u16(const QByteArray& b, int o) { uint16_t v; memcpy(&v, b.constData() + o, 2); return v; }
 
@@ -666,6 +666,7 @@ struct Narc
         }
         uint32_t s = u32(fatb, dir * 8), e = u32(fatb, dir * 8 + 4);
         f.seek(s); QByteArray d = f.read(e - s); if (!d.startsWith("NARC")) return;
+        base = s;
         uint32_t n = u32(d, 0x18);
         for (uint32_t i = 0; i < n; i++) fat.push_back({u32(d, 0x1C + i * 8), u32(d, 0x20 + i * 8)});
         uint32_t btnf = 0x1C + n * 8; gmif = btnf + u32(d, btnf + 4) + 8;
@@ -673,6 +674,7 @@ struct Narc
     }
 
     const uint8_t* file(int i, uint32_t& len) const { if (i < 0 || i >= (int)fat.size()) { len = 0; return nullptr; } len = fat[i].second - fat[i].first; return data.data() + gmif + fat[i].first; }
+    uint32_t romOffset(int i) const { return base + gmif + fat[i].first; }
 };
 
 static QRgb bgr555(const uint8_t* p) { uint16_t c; memcpy(&c, p, 2); return qRgb((c & 31) * 255 / 31, ((c >> 5) & 31) * 255 / 31, ((c >> 10) & 31) * 255 / 31); }
@@ -708,58 +710,85 @@ struct Sprites
 {
     Narc narc; std::map<int, QImage> cache;
 
+    // Offsets (from the member start) of the frame data and the 16-colour palette; frames = how many 512-byte frames fit.
+    static bool sheet(const uint8_t* d, uint32_t len, int frames, uint32_t& tex, uint32_t& pal)
+    {
+        if (!d || len < 0x60 || memcmp(d, "BTX0", 4)) return false;
+        uint32_t t; memcpy(&t, d + 0x10, 4);                        // first block = TEX0
+        if (t + 0x40 > len || memcmp(d + t, "TEX0", 4)) return false;
+        uint32_t texOff, palOff; memcpy(&texOff, d + t + 0x14, 4); memcpy(&palOff, d + t + 0x38, 4);
+        tex = t + texOff; pal = t + palOff;
+        return tex + frames * 512 <= len && pal + 32 <= len;
+    }
+
     QImage get(int mmodel, int frame)
     {
         int key = mmodel * 64 + frame; auto it = cache.find(key); if (it != cache.end()) return it->second;
         QImage img(32, 32, QImage::Format_ARGB32); img.fill(Qt::transparent);
-        uint32_t len; const uint8_t* d = narc.file(mmodel, len);
-        if (d && len > 0x60 && !memcmp(d, "BTX0", 4))
-        {
-            uint32_t t; memcpy(&t, d + 0x10, 4);                       // first block = TEX0
-            uint32_t texOff, palOff; memcpy(&texOff, d + t + 0x14, 4); memcpy(&palOff, d + t + 0x38, 4);
-            uint32_t px = t + texOff + frame * 512, pal = t + palOff;
-            if (!memcmp(d + t, "TEX0", 4) && px + 512 <= len && pal + 32 <= len)
-                for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++)
-                {
-                    int b = d[px + (y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
-                    img.setPixel(x, y, bgr555(d + pal + c * 2));
-                }
-        }
+        uint32_t len, tex, pal; const uint8_t* d = narc.file(mmodel, len);
+        if (sheet(d, len, frame + 1, tex, pal))
+            for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++)
+            {
+                int b = d[tex + frame * 512 + (y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
+                img.setPixel(x, y, bgr555(d + pal + c * 2));
+            }
         cache[key] = img; return img;
     }
 };
 
-// Human overworld sprites the player can wear: sprite id (what PlayerAvatar_GetSpriteByStateAndGender returns), mmodel
-// member, unique frames in the sheet (24 = full player sheet, 12 = NPC sheet), name. Generated from pokeheartgold
-// sprites.h + overlay_01_sprite_data.s, filtered to 32x32 sheets with animation set 0 or 7 (docs/fase1-sprites.md).
-// shortcut: only ids <= 255 fit the one-instruction patch (movs r0,#id); ids above need the overlay-1 table patch.
-struct SpriteDef { uint8_t id; uint16_t mmodel; uint8_t frames; const char* name; };
+// Human overworld sprites the player can wear: mmodel member, unique frames in the sheet (24 = full player sheet with run
+// frames, 12 = NPC sheet), name. From pokeheartgold mmodel.h, filtered to 32x32 4bpp sheets with 12 or 24 frames.
+// The player keeps the Hero sprite (and its 24-frame walk/run animation); we swap the Hero/Heroine texture data in the
+// in-memory ROM for the chosen sheet, NPC frames mapped per pose (docs/fase1-sprites.md). Run poses reuse walk frames.
+struct SpriteDef { uint16_t mmodel; uint8_t frames; const char* name; };
 const SpriteDef kSprites[] = {
-    {0,69,24,"Hero"}, {1,0,12,"Babyboy 1"}, {2,1,12,"Babygirl 1"}, {3,2,12,"Boy 1"},
-    {4,3,12,"Boy 2"}, {5,4,12,"Boy 3"}, {6,5,12,"Girl 1"}, {7,6,12,"Girl 2"},
-    {8,7,12,"Girl 3"}, {9,8,12,"Man 1"}, {10,9,12,"Man 2"}, {11,10,12,"Man 3"},
-    {12,12,12,"Woman 1"}, {13,13,12,"Woman 2"}, {14,14,12,"Woman 3"}, {15,16,12,"Middleman 1"},
-    {16,17,12,"Middlewoman 1"}, {17,18,12,"Oldman 1"}, {18,19,12,"Oldwoman 1"}, {19,34,12,"Bigman"},
-    {22,31,12,"Reporter"}, {24,23,12,"Shopm 1"}, {25,24,12,"Shopw 1"}, {29,25,12,"Assistantm"},
-    {30,26,12,"Assistantw"}, {31,36,12,"Badman"}, {33,22,12,"Skierw"}, {34,37,12,"Policeman"},
-    {35,38,12,"Idol"}, {36,39,12,"Gentleman"}, {37,40,12,"Lady"}, {40,41,12,"Workman"},
-    {41,42,12,"Farmer"}, {42,43,12,"Cowgirl"}, {43,44,12,"Clown"}, {44,45,12,"Artist"},
-    {45,46,12,"Sportsman"}, {50,47,12,"Explore"}, {51,48,12,"Fighter"}, {52,49,12,"Campboy"},
-    {53,50,12,"Picnicgirl"}, {55,52,12,"Ambrella"}, {56,53,12,"Seaman"}, {59,29,12,"Waiter"},
-    {60,30,12,"Waitress"}, {62,27,12,"Gorggeousm"}, {63,28,12,"Gorggeousw"}, {68,11,12,"Man 5"},
-    {69,15,12,"Woman 5"}, {70,33,12,"Mystery"}, {97,70,24,"Heroine"}, {99,54,12,"Doctor"},
-    {126,215,12,"Leader 1"}, {127,216,12,"Leader 2"}, {128,217,12,"Leader 3"}, {129,218,12,"Leader 4"},
-    {130,219,12,"Leader 5"}, {131,220,12,"Leader 6"}, {132,221,12,"Leader 7"}, {133,222,12,"Leader 8"},
-    {141,62,12,"Seven 1"}, {142,63,12,"Seven 2"}, {143,64,12,"Seven 3"}, {144,65,12,"Seven 4"},
-    {146,67,12,"Gsboy 1"}, {148,58,12,"Gsrivel"}, {168,57,12,"Sunglasses"}, {169,61,12,"Towerboss"},
-    {175,55,12,"Maid"}, {193,56,12,"Delivery"}, {211,170,12,"Red"}, {218,171,12,"Thief"},
-    {219,83,12,"Itako"}, {220,172,12,"Bozu"}, {223,175,12,"Rkanbuw"}, {224,176,12,"Rkanbum"},
-    {225,177,12,"Boarder"}, {229,179,12,"Gang"}, {232,180,12,"Dancer"}, {233,223,12,"Gantetsu"},
-    {235,181,12,"Masaki"}, {236,182,12,"Captain"}, {238,213,24,"Hero"}, {239,214,24,"Heroine"}
+    {0,12,"Babyboy 1"}, {1,12,"Babygirl 1"}, {2,12,"Boy 1"}, {3,12,"Boy 2"},
+    {4,12,"Boy 3"}, {5,12,"Girl 1"}, {6,12,"Girl 2"}, {7,12,"Girl 3"},
+    {8,12,"Man 1"}, {9,12,"Man 2"}, {10,12,"Man 3"}, {11,12,"Man 5"},
+    {12,12,"Woman 1"}, {13,12,"Woman 2"}, {14,12,"Woman 3"}, {15,12,"Woman 5"},
+    {16,12,"Middleman 1"}, {17,12,"Middlewoman 1"}, {18,12,"Oldman 1"}, {19,12,"Oldwoman 1"},
+    {22,12,"Skierw"}, {23,12,"Shopm 1"}, {24,12,"Shopw 1"}, {25,12,"Assistantm"},
+    {26,12,"Assistantw"}, {27,12,"Gorggeousm"}, {28,12,"Gorggeousw"}, {29,12,"Waiter"},
+    {30,12,"Waitress"}, {31,12,"Reporter"}, {33,12,"Mystery"}, {34,12,"Bigman"},
+    {36,12,"Badman"}, {37,12,"Policeman"}, {38,12,"Idol"}, {39,12,"Gentleman"},
+    {40,12,"Lady"}, {41,12,"Workman"}, {42,12,"Farmer"}, {43,12,"Cowgirl"},
+    {44,12,"Clown"}, {45,12,"Artist"}, {46,12,"Sportsman"}, {47,12,"Explore"},
+    {48,12,"Fighter"}, {49,12,"Campboy"}, {50,12,"Picnicgirl"}, {52,12,"Ambrella"},
+    {53,12,"Seaman"}, {54,12,"Doctor"}, {55,12,"Maid"}, {56,12,"Delivery"},
+    {57,12,"Sunglasses"}, {58,12,"Gsrivel"}, {59,12,"Daigo"}, {60,12,"Champion"},
+    {61,12,"Towerboss"}, {62,12,"Seven 1"}, {63,12,"Seven 2"}, {64,12,"Seven 3"},
+    {65,12,"Seven 4"}, {67,12,"Gsboy 1"}, {69,24,"Hero"}, {70,24,"Heroine"},
+    {83,12,"Itako"}, {101,12,"Wifism"}, {102,12,"Wifisf"}, {103,12,"Brains 1"},
+    {104,12,"Brains 2"}, {105,12,"Brains 3"}, {106,12,"Brains 4"}, {108,12,"Bfsm"},
+    {109,12,"Bfsw 1"}, {110,12,"Bfsw 2"}, {113,12,"Gsbabyboy 1"}, {114,12,"Gsbabygirl 1"},
+    {115,12,"Gsboy 2"}, {116,12,"Gsboy 3"}, {117,12,"Gsgirl 1"}, {118,12,"Gsgirl 2"},
+    {119,12,"Gsgirl 3"}, {120,12,"Gsman 1"}, {121,12,"Gsman 2"}, {122,12,"Gsman 3"},
+    {123,12,"Gswoman 1"}, {124,12,"Gswoman 2"}, {125,12,"Gswoman 3"}, {126,12,"Gsmiddleman 1"},
+    {127,12,"Middlewoman 1"}, {128,12,"Gsoldman 1"}, {129,12,"Gsoldwoman 1"}, {130,12,"Gsbigman"},
+    {132,12,"Shopm 1"}, {134,12,"Pcwoman 2"}, {135,12,"Pcwoman 3"}, {136,12,"Gsassistantm"},
+    {137,12,"Gsgentleman"}, {140,12,"Gsfighter"}, {141,12,"Campboy"}, {142,12,"Picnicgirl"},
+    {144,12,"Seaman"}, {145,12,"Mystery"}, {146,12,"Gsleader 1"}, {147,12,"Gsleader 2"},
+    {148,12,"Gsleader 3"}, {149,12,"Gsleader 4"}, {150,12,"Gsleader 5"}, {151,12,"Gsleader 6"},
+    {152,12,"Gsleader 7"}, {153,12,"Gsleader 8"}, {154,12,"Gsbigfour 1"}, {155,12,"Gsbigfour 2"},
+    {156,12,"Gsbigfour 3"}, {157,12,"Gsbigfour 4"}, {158,12,"Wataru"}, {159,12,"Gsmama"},
+    {160,12,"Ookido"}, {162,12,"Gsleader 9"}, {163,12,"Gsleader 10"}, {164,12,"Gsleader 11"},
+    {165,12,"Gsleader 12"}, {166,12,"Gsleader 13"}, {167,12,"Gsleader 14"}, {168,12,"Gsleader 15"},
+    {169,12,"Gsleader 16"}, {170,12,"Red"}, {171,12,"Thief"}, {172,12,"Bozu"},
+    {175,12,"Rkanbuw"}, {176,12,"Rkanbum"}, {177,12,"Boarder"}, {179,12,"Gang"},
+    {180,12,"Dancer"}, {181,12,"Masaki"}, {182,12,"Captain"}, {184,12,"Mania"},
+    {185,12,"Juggrer"}, {187,12,"Minaki"}, {188,12,"Thlonowner"}, {189,12,"Instructor"},
+    {190,12,"Kurumi"}, {191,12,"Nanami"}, {192,12,"Redmama"}, {193,12,"Counterm"},
+    {212,12,"Gswoman 6"}, {213,24,"Hero"}, {214,24,"Heroine"}, {215,12,"Leader 1"},
+    {216,12,"Leader 2"}, {217,12,"Leader 3"}, {218,12,"Leader 4"}, {219,12,"Leader 5"},
+    {220,12,"Leader 6"}, {221,12,"Leader 7"}, {222,12,"Leader 8"}, {223,12,"Gantetsu"},
+    {225,12,"Sakaki"}, {226,12,"Suit"}, {227,12,"Chourou"}, {244,12,"Rkanbum 2"},
+    {245,12,"Rkanbum 3"}, {246,24,"Plboy 01C"}, {247,24,"Plgirl 01C"}, {250,12,"Delivery 2"}
 };
 const int kNumSprites = sizeof kSprites / sizeof *kSprites;
-// WALKING case of PlayerAvatar_GetSpriteByStateAndGender in Sacred Gold (arm9 main, Thumb): movs r0,#id. Male / female branch.
-const uint32_t kSpritePatch[2] = {0x0205C8CC, 0x0205C938}; const uint16_t kSpriteOrig[2] = {0x2000, 0x2061};
+// Hero frame index -> NPC-sheet frame. Hero: up stand 0, walk 20/9, run 7/10 (8 same group); down stand 21, walk 23/22,
+// run 11/12/13; side stand 2, walk 3/1, run 15/14/16 (17-19, 4-6 same group). NPC: up 0/8/7, side 2/3/1, down 9/10/11.
+const uint8_t kNpcMap[24] = {0, 1, 2, 3, 2, 2, 2, 8, 7, 7, 7, 10, 11, 10, 2, 3, 1, 2, 3, 1, 8, 9, 11, 10};
+
 
 // HeartGold party-menu palette
 const QColor cBg(0x3f, 0x9f, 0xb0), cHead(0x1e, 0x5a, 0x66), cSlot(0xf8, 0xf4, 0xe0), cSlotDead(0xd8, 0xd0, 0xc8), cGold(0xe8, 0xc8, 0x60),
@@ -781,8 +810,8 @@ public:
         QObject::connect(&sock, &QUdpSocket::readyRead, [this] { receive(); });
         QObject::connect(&timer, &QTimer::timeout, [this] { poll(); });
         timer.start(250);
-        spriteId = Config::GetGlobalTable().GetInt("HGT.Sprite") - 1;   // stored +1 so "unset" (0) = game default
-        if (const char* e = getenv("HGT_SPRITE")) spriteId = atoi(e);
+        spriteMm = Config::GetGlobalTable().GetInt("HGT.Sprite") - 1;   // stored +1 so "unset" (0) = game default
+        if (const char* e = getenv("HGT_SPRITE")) spriteMm = atoi(e);   // mmodel member, for the launcher / headless tests
         if (const char* e = getenv("HGT_DOCK_PAGE")) page = atoi(e);   // headless test: dump a given page
     }
 
@@ -790,7 +819,7 @@ private:
     EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
     Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites;
-    int spriteId = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // -1 = game default
+    int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0;
 
@@ -889,17 +918,32 @@ private:
     }
 
     // --- trainer sprite ---
-    // Keeps the chosen sprite patched into the game; the game reloads the player sprite at the next warp (door).
-    // Only touches the two halfwords while they still hold a movs r0,#x, so nothing is written before the game is up.
+    // Keeps the Hero and Heroine texture data in the in-memory cart ROM equal to the chosen sheet (or the original);
+    // the game reloads the player sprite from the ROM at the next warp (door). Cheap: a memcmp per 250 ms.
     void applySprite(NDS& nds)
     {
-        for (int i = 0; i < 2; i++)
+        auto* cart = nds.GetNDSCart(); if (!cart || sprites.narc.data.empty()) return;
+        uint8_t* rom = const_cast<uint8_t*>(cart->GetROM()); uint32_t romLen = cart->GetROMLength();
+        const SpriteDef* d = spriteDef(spriteMm);
+        uint32_t slen = 0, texS = 0, palS = 0; const uint8_t* src = d ? sprites.narc.file(d->mmodel, slen) : nullptr;
+        if (d && !Sprites::sheet(src, slen, d->frames, texS, palS)) d = nullptr;
+        for (int member : {69, 70})
         {
-            uint16_t want = spriteId < 0 ? kSpriteOrig[i] : (uint16_t)(0x2000 | spriteId), cur = nds.ARM9Read16(kSpritePatch[i]);
-            if ((cur & 0xFF00) == 0x2000 && cur != want) { nds.ARM9Write16(kSpritePatch[i], want); fprintf(stderr, "HGT: sprite %08X <- %04X\n", kSpritePatch[i], want); }
+            uint32_t hlen, texH, palH; const uint8_t* orig = sprites.narc.file(member, hlen);
+            if (!Sprites::sheet(orig, hlen, 24, texH, palH)) continue;
+            uint32_t at = sprites.narc.romOffset(member); if ((uint64_t)at + hlen > romLen) continue;
+            uint8_t want[24 * 512 + 32];
+            for (int k = 0; k < 24; k++) memcpy(want + k * 512, d ? src + texS + (d->frames == 24 ? k : kNpcMap[k]) * 512 : orig + texH + k * 512, 512);
+            memcpy(want + 24 * 512, d ? src + palS : orig + palH, 32);
+            uint8_t* dst = rom + at;
+            if (memcmp(dst + texH, want, 24 * 512) || memcmp(dst + palH, want + 24 * 512, 32))
+            {
+                memcpy(dst + texH, want, 24 * 512); memcpy(dst + palH, want + 24 * 512, 32);
+                fprintf(stderr, "HGT: sprite sheet %d <- mmodel %d\n", member, d ? d->mmodel : member);
+            }
         }
     }
-    const SpriteDef* spriteDef(int id) const { for (auto& d : kSprites) if (d.id == id) return &d; return nullptr; }
+    const SpriteDef* spriteDef(int mm) const { for (auto& d : kSprites) if (d.mmodel == mm) return &d; return nullptr; }
     QImage thumb(const SpriteDef* d) { return d ? sprites.get(d->mmodel, d->frames == 24 ? 21 : 9) : sprites.get(gender ? 70 : 69, 21); }   // facing-down stand frame
 
     void mousePressEvent(QMouseEvent* e) override
@@ -909,8 +953,8 @@ private:
         for (int i = 0; i < (int)spriteCells.size(); i++)
             if (spriteCells[i].contains(e->pos()))
             {
-                spriteId = i == 0 ? -1 : kSprites[i - 1].id;
-                Config::GetGlobalTable().SetInt("HGT.Sprite", spriteId + 1); Config::Save();
+                spriteMm = i == 0 ? -1 : kSprites[i - 1].mmodel;
+                Config::GetGlobalTable().SetInt("HGT.Sprite", spriteMm + 1); Config::Save();
                 update(); return;
             }
     }
@@ -980,7 +1024,7 @@ private:
         g.drawText(QRect(tx, y + 18, tw, 16), (right ? Qt::AlignRight : Qt::AlignLeft) | Qt::AlignVCenter, statusText(e->status));
     }
 
-    // Pokegear-style tool bar: an icon tile per tool, the open one lit; the tool opens under the bar, Soul Link stays below it.
+    // Pokegear-style tool bar: an icon tile per tool, the open one lit; the tool opens under the bar, Soul Link stays above it.
     // New features = one more tile + one more page.
     void tabBar(QPainter& g, int& y, const std::vector<Pair>& ps)
     {
@@ -998,7 +1042,7 @@ private:
                 g.setPen(QPen(cFrame, 2)); g.drawLine(cx, iy + 7, cx, iy + 17); g.drawLine(cx - 4, iy + 10, cx + 4, iy + 10);
                 if (graves) { g.setPen(Qt::NoPen); g.setBrush(cRed); g.drawEllipse(r.right() - 18, r.y() + 2, 16, 16); g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(r.right() - 18, r.y() + 2, 16, 16), Qt::AlignCenter, QString::number(graves)); f.setBold(false); g.setFont(f); }
             }
-            else g.drawImage(cx - 16, iy - 4, thumb(spriteDef(spriteId)));   // the trainer you are
+            else g.drawImage(cx - 16, iy - 4, thumb(spriteDef(spriteMm)));   // the trainer you are
             g.setPen(on ? cText : cWhite); f.setPointSize(8); g.setFont(f); g.drawText(QRect(r.x(), r.bottom() - 16, r.width(), 14), Qt::AlignCenter, names[i]); f.setPointSize(10); g.setFont(f);
         }
         y += 64;
@@ -1007,7 +1051,6 @@ private:
     void pageSoulLink(QPainter& g, int& y, const std::vector<Pair>& ps)
     {
         int W = width(); QFont f = g.font();
-        if (page) header(g, y, "SOUL LINK");   // separates it from an open tool above
         // teams
         int colW = (W - 24) / 2;
         for (int side = 0; side < 2; side++)
@@ -1083,7 +1126,7 @@ private:
     {
         int W = width(); QFont f = g.font();
         header(g, y, "TRAINER SPRITE");
-        const SpriteDef* cur = spriteDef(spriteId);
+        const SpriteDef* cur = spriteDef(spriteMm);
         QRect hr(8, y, W - 16, 44); slotBox(g, hr, false);
         g.drawImage(hr.x() + 10, hr.y() + 6, thumb(cur));
         g.setPen(cText); f.setBold(true); g.setFont(f); g.drawText(hr.x() + 50, hr.y() + 19, cur ? cur->name : "Default"); f.setBold(false); g.setFont(f);
@@ -1093,7 +1136,7 @@ private:
         for (int i = 0; i < n; i++)
         {
             QRect c(8 + (i % cols) * 38, y + (i / cols) * 40, 36, 38); spriteCells.push_back(c);
-            bool sel = i == 0 ? spriteId < 0 : (cur && kSprites[i - 1].id == cur->id);
+            bool sel = i == 0 ? spriteMm < 0 : (cur && kSprites[i - 1].mmodel == cur->mmodel);
             g.setPen(QPen(sel ? cGold : cBrown.lighter(140), sel ? 2 : 1)); g.setBrush(sel ? cSlot : cSlotDead); g.drawRoundedRect(c.adjusted(1, 1, -1, -1), 4, 4);
             g.drawImage(c.x() + 2, c.y() + 3, i == 0 ? thumb(nullptr) : thumb(&kSprites[i - 1]));
         }
@@ -1112,9 +1155,9 @@ private:
         g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 20); g.setPen(cText);
         g.drawText(QRect(16, y, W - 32, 20), Qt::AlignVCenter, QString("%1 %2 %3  %4  Cap %5 (%6)  %4  %7/16 badges").arg(myName, QChar(0x2194), peerName, QChar(0x00b7)).arg(cap.cap).arg(cap.name).arg(badges));
         y += 26;
-        tabBar(g, y, ps);
-        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y);
         pageSoulLink(g, y, ps);
+        y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
+        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y);
         y += 8;
         if (y != contentHeight) { contentHeight = y; setMinimumHeight(y); }
     }
