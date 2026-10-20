@@ -1,8 +1,10 @@
 name: Windows
 
 on:
+  workflow_dispatch:
   push:
     branches:
+      - hg-together
       - master
       - ci/*
   pull_request:
