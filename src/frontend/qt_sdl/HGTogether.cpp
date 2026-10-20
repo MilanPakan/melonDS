@@ -133,6 +133,7 @@ void dump(const u32* fb)
 // HGT_CTL=<fifo>: stuurkanaal voor tests zonder mens. Regels: "k MASK N" (toetsen MASK = bits A1 B2 Sel4 St8 R16 L32 U64 D128
 // R256 L512 X1024 Y2048, N frames vast), "t X Y N" (touch N frames), "w N" (wachten), "s PAD" (screenshot boven+onder
 // als 256x384 PPM), "r ADDR LEN PAD" (hex-dump RAM). Commando's lopen op volgorde, één tegelijk.
+std::vector<u8> hexBytes(const std::string& h);
 int ctlFd = -1; std::string ctlBuf; std::deque<std::string> ctlQ; u32 ctlKeys = 0, ctlFrames = 0; int ctlTouchX = -1, ctlTouchY = -1;
 void ctlPoll()
 {
@@ -158,10 +159,32 @@ void ctlRead(NDS& nds, u32 addr, u32 len, const char* path)
     for (u32 i = 0; i < len; i++) fprintf(f, "%02X", nds.ARM9Read8(addr + i));
     fprintf(f, "\n"); fclose(f); rename(tmp.c_str(), path);
 }
+// "c ADDR A0 A1 A2 A3 PAD": ROM-functie aanroepen via de mailbox-cave (bench/multicave.py hangt een bl in
+// FieldSystem_Control, dus de aanroep gebeurt elk overworld-frame vanuit de hoofdlus van het spel zelf).
+// Mailbox: [0]=functie (0 = vrij) [4..16]=r0-r3 [20]=r0-resultaat [24]=klaar-vlag.
+const u32 kMailbox = 0x020511D0;
+struct Call { u32 addr, a[4]; std::string out; bool pending = false, active = false; u32 frames = 0; } call;
+void callStart(NDS& nds)
+{
+    for (int i = 0; i < 4; i++) nds.ARM9Write32(kMailbox + 4 + 4 * i, call.a[i]);
+    nds.ARM9Write32(kMailbox + 24, 0); nds.ARM9Write32(kMailbox, call.addr | 1);
+    call.pending = false; call.active = true; call.frames = 0;
+}
+bool callPoll(NDS& nds)   // true = klaar
+{
+    if (!nds.ARM9Read32(kMailbox + 24)) { if (++call.frames == 1800) fprintf(stderr, "HGT: call %08X loopt al 30 s (hook actief?)\n", call.addr); return false; }
+    u32 r0 = nds.ARM9Read32(kMailbox + 20); nds.ARM9Write32(kMailbox + 24, 0);
+    std::string tmp = call.out + ".tmp"; FILE* f = fopen(tmp.c_str(), "w");
+    if (f) { fprintf(f, "%08X\n", r0); fclose(f); rename(tmp.c_str(), call.out.c_str()); }
+    fprintf(stderr, "HGT: call %08X -> r0=%08X (f%u)\n", call.addr, r0, call.frames);
+    call.active = false; return true;
+}
 bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
 {
     if (ctlFd < 0) return false;
     ctlPoll();
+    if (call.active && !callPoll(nds)) return false;
+    if (call.pending) { callStart(nds); return false; }
     while (ctlFrames == 0 && !ctlQ.empty())
     {
         std::string l = ctlQ.front(); ctlQ.pop_front();
@@ -173,6 +196,8 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
         else if (c == 'w' && sscanf(a, "%u", &n) == 1) ctlFrames = n;
         else if (c == 's' && sscanf(a, "%511s", path) == 1) ctlShot(nds, path);
         else if (c == 'r' && sscanf(a, "%x %u %511s", &x, &n, path) == 3) ctlRead(nds, x, n, path);
+        else if (c == 'p' && sscanf(a, "%x %511s", &x, path) == 2) { std::vector<u8> v = hexBytes(path); for (size_t i = 0; i < v.size(); i++) nds.ARM9Write8(x + i, v[i]); }
+        else if (c == 'c' && sscanf(a, "%x %x %x %x %x %511s", &x, &call.a[0], &call.a[1], &call.a[2], &call.a[3], path) == 6) { call.addr = x; call.out = path; call.pending = true; break; }
         else if (!l.empty()) fprintf(stderr, "HGT: ctl '%s' ongeldig\n", l.c_str());
     }
     if (ctlFrames == 0) return false;

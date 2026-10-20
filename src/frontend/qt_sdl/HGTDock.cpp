@@ -6,7 +6,9 @@
 #include "HGTDock.h"
 #include "EmuInstance.h"
 #include "NDS.h"
+#include "Config.h"
 #include <QPainter>
+#include <QMouseEvent>
 #include <QTimer>
 #include <QUdpSocket>
 #include <QScrollArea>
@@ -16,8 +18,10 @@
 #include <QFile>
 #include <QHostAddress>
 #include <QDateTime>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <algorithm>
 #include <map>
 #include <vector>
@@ -634,20 +638,19 @@ bool readMon(NDS& nds, uint32_t a, Mon& m)
 }
 
 // --- ROM icon sprites (a/0/2/0 = poke_icon.narc: file 0 NCLR, file 7+ NCGR 32x64 4bpp, two frames) ---
-struct Icons
+// One NARC from the player's ROM (FNT walk by path), kept in memory.
+struct Narc
 {
-    bool loaded = false; std::vector<uint8_t> narc; std::vector<std::pair<uint32_t, uint32_t>> fat; uint32_t gmif = 0;
-    std::map<int, QImage> cache;
-
+    std::vector<uint8_t> data; std::vector<std::pair<uint32_t, uint32_t>> fat; uint32_t gmif = 0;
     static uint32_t u32(const QByteArray& b, int o) { uint32_t v; memcpy(&v, b.constData() + o, 4); return v; }
     static uint16_t u16(const QByteArray& b, int o) { uint16_t v; memcpy(&v, b.constData() + o, 2); return v; }
 
-    void load(const QString& romPath)
+    void load(const QString& romPath, std::initializer_list<const char*> parts)
     {
-        loaded = true; QFile f(romPath); if (!f.open(QIODevice::ReadOnly)) return;
+        QFile f(romPath); if (!f.open(QIODevice::ReadOnly)) return;
         f.seek(0x40); QByteArray hdr = f.read(16); uint32_t fntOff = u32(hdr, 0), fntLen = u32(hdr, 4), fatOff = u32(hdr, 8), fatLen = u32(hdr, 12);
         f.seek(fntOff); QByteArray fnt = f.read(fntLen); f.seek(fatOff); QByteArray fatb = f.read(fatLen);
-        int dir = 0xF000; const char* parts[] = {"a", "0", "2", "0"}; int fileId = -1;
+        int dir = 0xF000;
         for (const char* part : parts)
         {
             uint32_t sub = u32(fnt, (dir & 0xFFF) * 8); int fid = u16(fnt, (dir & 0xFFF) * 8 + 4); int p = sub, next = -1;
@@ -661,23 +664,29 @@ struct Icons
             if (next < 0) return;
             dir = next;
         }
-        fileId = dir;
-        uint32_t s = u32(fatb, fileId * 8), e = u32(fatb, fileId * 8 + 4);
-        f.seek(s); QByteArray data = f.read(e - s); if (!data.startsWith("NARC")) return;
-        uint32_t n = u32(data, 0x18);
-        for (uint32_t i = 0; i < n; i++) fat.push_back({u32(data, 0x1C + i * 8), u32(data, 0x20 + i * 8)});
-        uint32_t btnf = 0x1C + n * 8; gmif = btnf + u32(data, btnf + 4) + 8;
-        narc.assign(data.begin(), data.end());
+        uint32_t s = u32(fatb, dir * 8), e = u32(fatb, dir * 8 + 4);
+        f.seek(s); QByteArray d = f.read(e - s); if (!d.startsWith("NARC")) return;
+        uint32_t n = u32(d, 0x18);
+        for (uint32_t i = 0; i < n; i++) fat.push_back({u32(d, 0x1C + i * 8), u32(d, 0x20 + i * 8)});
+        uint32_t btnf = 0x1C + n * 8; gmif = btnf + u32(d, btnf + 4) + 8;
+        data.assign(d.begin(), d.end());
     }
 
-    const uint8_t* file(int i, uint32_t& len) { if (i < 0 || i >= (int)fat.size()) { len = 0; return nullptr; } len = fat[i].second - fat[i].first; return narc.data() + gmif + fat[i].first; }
+    const uint8_t* file(int i, uint32_t& len) const { if (i < 0 || i >= (int)fat.size()) { len = 0; return nullptr; } len = fat[i].second - fat[i].first; return data.data() + gmif + fat[i].first; }
+};
+
+static QRgb bgr555(const uint8_t* p) { uint16_t c; memcpy(&c, p, 2); return qRgb((c & 31) * 255 / 31, ((c >> 5) & 31) * 255 / 31, ((c >> 10) & 31) * 255 / 31); }
+
+struct Icons   // party icons: NARC a/0/2/0 (NCLR member 0, NCGR per species)
+{
+    Narc narc; std::map<int, QImage> cache;
 
     QImage get(int species, bool egg)
     {
         int naix = egg ? 501 : species + 7;
         auto it = cache.find(naix); if (it != cache.end()) return it->second;
         QImage img(32, 32, QImage::Format_ARGB32); img.fill(Qt::transparent);
-        uint32_t plen, glen; const uint8_t* pal = file(0, plen); const uint8_t* gfx = file(naix, glen);
+        uint32_t plen, glen; const uint8_t* pal = narc.file(0, plen); const uint8_t* gfx = narc.file(naix, glen);
         if (pal && gfx && plen >= 0x28 && glen >= 0x30 + 1024)
         {
             int palNo = (naix - 7) < (int)sizeof kIconPal && naix >= 7 ? kIconPal[naix - 7] : 0;
@@ -687,13 +696,70 @@ struct Icons
             {
                 int tile = (y / 8) * 4 + x / 8, b = px[tile * 32 + (y % 8) * 4 + (x % 8) / 2];
                 int c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
-                uint16_t bgr; memcpy(&bgr, colors + c * 2, 2);
-                img.setPixel(x, y, qRgb((bgr & 31) * 255 / 31, ((bgr >> 5) & 31) * 255 / 31, ((bgr >> 10) & 31) * 255 / 31));
+                img.setPixel(x, y, bgr555(colors + c * 2));
             }
         }
         cache[naix] = img; return img;
     }
 };
+
+// Overworld trainer sprites: NARC a/0/8/1 (mmodel), one NSBTX per sprite with 32x32 4bpp frames (docs/fase1-sprites.md).
+struct Sprites
+{
+    Narc narc; std::map<int, QImage> cache;
+
+    QImage get(int mmodel, int frame)
+    {
+        int key = mmodel * 64 + frame; auto it = cache.find(key); if (it != cache.end()) return it->second;
+        QImage img(32, 32, QImage::Format_ARGB32); img.fill(Qt::transparent);
+        uint32_t len; const uint8_t* d = narc.file(mmodel, len);
+        if (d && len > 0x60 && !memcmp(d, "BTX0", 4))
+        {
+            uint32_t t; memcpy(&t, d + 0x10, 4);                       // first block = TEX0
+            uint32_t texOff, palOff; memcpy(&texOff, d + t + 0x14, 4); memcpy(&palOff, d + t + 0x38, 4);
+            uint32_t px = t + texOff + frame * 512, pal = t + palOff;
+            if (!memcmp(d + t, "TEX0", 4) && px + 512 <= len && pal + 32 <= len)
+                for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++)
+                {
+                    int b = d[px + (y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
+                    img.setPixel(x, y, bgr555(d + pal + c * 2));
+                }
+        }
+        cache[key] = img; return img;
+    }
+};
+
+// Human overworld sprites the player can wear: sprite id (what PlayerAvatar_GetSpriteByStateAndGender returns), mmodel
+// member, unique frames in the sheet (24 = full player sheet, 12 = NPC sheet), name. Generated from pokeheartgold
+// sprites.h + overlay_01_sprite_data.s, filtered to 32x32 sheets with animation set 0 or 7 (docs/fase1-sprites.md).
+// shortcut: only ids <= 255 fit the one-instruction patch (movs r0,#id); ids above need the overlay-1 table patch.
+struct SpriteDef { uint8_t id; uint16_t mmodel; uint8_t frames; const char* name; };
+const SpriteDef kSprites[] = {
+    {0,69,24,"Hero"}, {1,0,12,"Babyboy 1"}, {2,1,12,"Babygirl 1"}, {3,2,12,"Boy 1"},
+    {4,3,12,"Boy 2"}, {5,4,12,"Boy 3"}, {6,5,12,"Girl 1"}, {7,6,12,"Girl 2"},
+    {8,7,12,"Girl 3"}, {9,8,12,"Man 1"}, {10,9,12,"Man 2"}, {11,10,12,"Man 3"},
+    {12,12,12,"Woman 1"}, {13,13,12,"Woman 2"}, {14,14,12,"Woman 3"}, {15,16,12,"Middleman 1"},
+    {16,17,12,"Middlewoman 1"}, {17,18,12,"Oldman 1"}, {18,19,12,"Oldwoman 1"}, {19,34,12,"Bigman"},
+    {22,31,12,"Reporter"}, {24,23,12,"Shopm 1"}, {25,24,12,"Shopw 1"}, {29,25,12,"Assistantm"},
+    {30,26,12,"Assistantw"}, {31,36,12,"Badman"}, {33,22,12,"Skierw"}, {34,37,12,"Policeman"},
+    {35,38,12,"Idol"}, {36,39,12,"Gentleman"}, {37,40,12,"Lady"}, {40,41,12,"Workman"},
+    {41,42,12,"Farmer"}, {42,43,12,"Cowgirl"}, {43,44,12,"Clown"}, {44,45,12,"Artist"},
+    {45,46,12,"Sportsman"}, {50,47,12,"Explore"}, {51,48,12,"Fighter"}, {52,49,12,"Campboy"},
+    {53,50,12,"Picnicgirl"}, {55,52,12,"Ambrella"}, {56,53,12,"Seaman"}, {59,29,12,"Waiter"},
+    {60,30,12,"Waitress"}, {62,27,12,"Gorggeousm"}, {63,28,12,"Gorggeousw"}, {68,11,12,"Man 5"},
+    {69,15,12,"Woman 5"}, {70,33,12,"Mystery"}, {97,70,24,"Heroine"}, {99,54,12,"Doctor"},
+    {126,215,12,"Leader 1"}, {127,216,12,"Leader 2"}, {128,217,12,"Leader 3"}, {129,218,12,"Leader 4"},
+    {130,219,12,"Leader 5"}, {131,220,12,"Leader 6"}, {132,221,12,"Leader 7"}, {133,222,12,"Leader 8"},
+    {141,62,12,"Seven 1"}, {142,63,12,"Seven 2"}, {143,64,12,"Seven 3"}, {144,65,12,"Seven 4"},
+    {146,67,12,"Gsboy 1"}, {148,58,12,"Gsrivel"}, {168,57,12,"Sunglasses"}, {169,61,12,"Towerboss"},
+    {175,55,12,"Maid"}, {193,56,12,"Delivery"}, {211,170,12,"Red"}, {218,171,12,"Thief"},
+    {219,83,12,"Itako"}, {220,172,12,"Bozu"}, {223,175,12,"Rkanbuw"}, {224,176,12,"Rkanbum"},
+    {225,177,12,"Boarder"}, {229,179,12,"Gang"}, {232,180,12,"Dancer"}, {233,223,12,"Gantetsu"},
+    {235,181,12,"Masaki"}, {236,182,12,"Captain"}, {238,213,24,"Hero"}, {239,214,24,"Heroine"}
+};
+const int kNumSprites = sizeof kSprites / sizeof *kSprites;
+// WALKING case of PlayerAvatar_GetSpriteByStateAndGender in Sacred Gold (arm9 main, Thumb): movs r0,#id. Male / female branch.
+const uint32_t kSpritePatch[2] = {0x0205C8CC, 0x0205C938}; const uint16_t kSpriteOrig[2] = {0x2000, 0x2061};
 
 // HeartGold party-menu palette
 const QColor cBg(0x3f, 0x9f, 0xb0), cHead(0x1e, 0x5a, 0x66), cSlot(0xf8, 0xf4, 0xe0), cSlotDead(0xd8, 0xd0, 0xc8), cGold(0xe8, 0xc8, 0x60),
@@ -715,12 +781,17 @@ public:
         QObject::connect(&sock, &QUdpSocket::readyRead, [this] { receive(); });
         QObject::connect(&timer, &QTimer::timeout, [this] { poll(); });
         timer.start(250);
+        spriteId = Config::GetGlobalTable().GetInt("HGT.Sprite") - 1;   // stored +1 so "unset" (0) = game default
+        if (const char* e = getenv("HGT_SPRITE")) spriteId = atoi(e);
+        if (const char* e = getenv("HGT_DOCK_PAGE")) page = atoi(e);   // headless test: dump a given page
     }
 
 private:
     EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
-    Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons;
+    Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites;
+    int spriteId = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // -1 = game default
+    int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0;
 
     // --- data ---
@@ -740,7 +811,7 @@ private:
         uint32_t prof = saveData + 0x10 + nds.ARM9Read32(saveData + 0x23014 + 1 * 0x10 + 8) + 4; char nm[8] = {};
         for (int i = 0; i < 7; i++) { uint16_t c = nds.ARM9Read16(prof + 2 * i); if (c == 0xFFFF) break; nm[i] = dsChar(c); }
         if (nm[0]) myName = nm;
-        johto = nds.ARM9Read8(prof + 0x1A); kanto = nds.ARM9Read8(prof + 0x1F); gameClear = nds.ARM9Read8(prof + 0x1D) & 1;
+        gender = nds.ARM9Read8(prof + 0x18); johto = nds.ARM9Read8(prof + 0x1A); kanto = nds.ARM9Read8(prof + 0x1F); gameClear = nds.ARM9Read8(prof + 0x1D) & 1;
         uint32_t party = saveData + 0x10 + nds.ARM9Read32(hdr + 8), cur = nds.ARM9Read32(party + 4); if (cur > 6) return false;
         Mon tmp[6]; int n = 0;
         for (uint32_t i = 0; i < cur; i++) if (readMon(nds, party + 8 + i * 0xEC, tmp[n])) n++;
@@ -810,10 +881,38 @@ private:
     void poll()
     {
         NDS* nds = emu->getNDS(); if (!nds) return;
-        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); icons.load(rom); } }
+        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); } }
         if (readParty(*nds)) updateLog();
+        applySprite(*nds);
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
+    }
+
+    // --- trainer sprite ---
+    // Keeps the chosen sprite patched into the game; the game reloads the player sprite at the next warp (door).
+    // Only touches the two halfwords while they still hold a movs r0,#x, so nothing is written before the game is up.
+    void applySprite(NDS& nds)
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            uint16_t want = spriteId < 0 ? kSpriteOrig[i] : (uint16_t)(0x2000 | spriteId), cur = nds.ARM9Read16(kSpritePatch[i]);
+            if ((cur & 0xFF00) == 0x2000 && cur != want) { nds.ARM9Write16(kSpritePatch[i], want); fprintf(stderr, "HGT: sprite %08X <- %04X\n", kSpritePatch[i], want); }
+        }
+    }
+    const SpriteDef* spriteDef(int id) const { for (auto& d : kSprites) if (d.id == id) return &d; return nullptr; }
+    QImage thumb(const SpriteDef* d) { return d ? sprites.get(d->mmodel, d->frames == 24 ? 21 : 9) : sprites.get(gender ? 70 : 69, 21); }   // facing-down stand frame
+
+    void mousePressEvent(QMouseEvent* e) override
+    {
+        for (int i = 0; i < (int)tabRects.size(); i++) if (tabRects[i].contains(e->pos())) { page = page == i + 1 ? 0 : i + 1; update(); return; }   // click again = close
+        if (page != 2) return;
+        for (int i = 0; i < (int)spriteCells.size(); i++)
+            if (spriteCells[i].contains(e->pos()))
+            {
+                spriteId = i == 0 ? -1 : kSprites[i - 1].id;
+                Config::GetGlobalTable().SetInt("HGT.Sprite", spriteId + 1); Config::Save();
+                update(); return;
+            }
     }
 
     // --- pairs ---
@@ -881,19 +980,34 @@ private:
         g.drawText(QRect(tx, y + 18, tw, 16), (right ? Qt::AlignRight : Qt::AlignLeft) | Qt::AlignVCenter, statusText(e->status));
     }
 
-    void paintEvent(QPaintEvent*) override
+    // Pokegear-style tool bar: an icon tile per tool, the open one lit; the tool opens under the bar, Soul Link stays below it.
+    // New features = one more tile + one more page.
+    void tabBar(QPainter& g, int& y, const std::vector<Pair>& ps)
     {
-        QPainter g(this); g.fillRect(rect(), cBg); QFont f = g.font(); f.setPointSize(10); g.setFont(f);
-        int W = width(), y = 0; auto ps = pairs();
-        qint64 since = peerSeen ? (QDateTime::currentMSecsSinceEpoch() - peerSeen) / 1000 : -1; bool online = since >= 0 && since < 3;
-        QString status = online ? QString(QChar(0x25cf)) + " connected" : since < 0 ? QString(QChar(0x25cb)) + " waiting for friend" : QString(QChar(0x25cb)) + QString(" no signal %1s").arg(since);
-        header(g, y, "SOUL LINK");
-        g.setPen(online ? cGreen : cYellow); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, status);
-        Boss cap = levelCap(johto, kanto, gameClear); int badges = __builtin_popcount(johto) + __builtin_popcount(kanto);
-        g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 20); g.setPen(cText);
-        g.drawText(QRect(16, y, W - 32, 20), Qt::AlignVCenter, QString("%1 %2 %3  %4  Cap %5 (%6)  %4  %7/16 badges").arg(myName, QChar(0x2194), peerName, QChar(0x00b7)).arg(cap.cap).arg(cap.name).arg(badges));
-        y += 26;
+        const char* names[] = {"Graveyard", "Sprite"}; int n = 2, tw = 64, x0 = (width() - n * (tw + 8)) / 2 + 4;
+        int graves = 0; for (auto& p : ps) if (pairDead(p)) graves++;
+        tabRects.clear(); QFont f = g.font();
+        for (int i = 0; i < n; i++)
+        {
+            QRect r(x0 + i * (tw + 8), y, tw, 58); tabRects.push_back(r); bool on = i + 1 == page;
+            g.setPen(QPen(on ? cGold : cHead.darker(130), 2)); g.setBrush(on ? cSlot : cHead); g.drawRoundedRect(r.adjusted(1, 1, -1, -1), 6, 6);
+            int cx = r.center().x(), iy = r.y() + 6;
+            if (i == 0)       // tombstone
+            {
+                g.setPen(QPen(cFrame, 1)); g.setBrush(graves ? QColor(0x90, 0x90, 0x98) : cSlotDead); g.drawRoundedRect(cx - 9, iy + 2, 18, 22, 8, 8); g.drawRect(cx - 12, iy + 20, 24, 4);
+                g.setPen(QPen(cFrame, 2)); g.drawLine(cx, iy + 7, cx, iy + 17); g.drawLine(cx - 4, iy + 10, cx + 4, iy + 10);
+                if (graves) { g.setPen(Qt::NoPen); g.setBrush(cRed); g.drawEllipse(r.right() - 18, r.y() + 2, 16, 16); g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(r.right() - 18, r.y() + 2, 16, 16), Qt::AlignCenter, QString::number(graves)); f.setBold(false); g.setFont(f); }
+            }
+            else g.drawImage(cx - 16, iy - 4, thumb(spriteDef(spriteId)));   // the trainer you are
+            g.setPen(on ? cText : cWhite); f.setPointSize(8); g.setFont(f); g.drawText(QRect(r.x(), r.bottom() - 16, r.width(), 14), Qt::AlignCenter, names[i]); f.setPointSize(10); g.setFont(f);
+        }
+        y += 64;
+    }
 
+    void pageSoulLink(QPainter& g, int& y, const std::vector<Pair>& ps)
+    {
+        int W = width(); QFont f = g.font();
+        if (page) header(g, y, "SOUL LINK");   // separates it from an open tool above
         // teams
         int colW = (W - 24) / 2;
         for (int side = 0; side < 2; side++)
@@ -920,7 +1034,8 @@ private:
                 if (!pairDead(p) && p.mine->status != p.theirs->status) acts << QString("▶ Box rule: %1 is in the %2, %3 in the %4.").arg(p.mine->nick, p.mine->status == BOX ? "box" : "team", p.theirs->nick, p.theirs->status == BOX ? "box" : "team");
             }
         }
-        if (!online) acts << "▶ Friend not connected.";
+        qint64 since = peerSeen ? (QDateTime::currentMSecsSinceEpoch() - peerSeen) / 1000 : -1;
+        if (!(since >= 0 && since < 3)) acts << "▶ Friend not connected.";
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
         for (auto& a : acts) { int h = g.fontMetrics().boundingRect(QRect(0, 0, tw, 1000), Qt::TextWordWrap, a).height() + 4; hs << h; ah += h; }
@@ -943,8 +1058,11 @@ private:
             y += 60;
         }
         if (ps.empty()) { g.setPen(cWhite); g.drawText(16, y + 14, "No catches yet."); y += 24; }
+    }
 
-        // graveyard
+    void pageGraveyard(QPainter& g, int& y, const std::vector<Pair>& ps)
+    {
+        int W = width(); QFont f = g.font();
         header(g, y, "GRAVEYARD");
         int graves = 0;
         for (auto& p : ps)
@@ -959,6 +1077,44 @@ private:
             y += 60;
         }
         if (!graves) { g.setPen(cWhite); g.drawText(16, y + 14, "Empty. Keep it that way."); y += 24; }
+    }
+
+    void pageSprite(QPainter& g, int& y)
+    {
+        int W = width(); QFont f = g.font();
+        header(g, y, "TRAINER SPRITE");
+        const SpriteDef* cur = spriteDef(spriteId);
+        QRect hr(8, y, W - 16, 44); slotBox(g, hr, false);
+        g.drawImage(hr.x() + 10, hr.y() + 6, thumb(cur));
+        g.setPen(cText); f.setBold(true); g.setFont(f); g.drawText(hr.x() + 50, hr.y() + 19, cur ? cur->name : "Default"); f.setBold(false); g.setFont(f);
+        g.setPen(cMuted); g.drawText(hr.x() + 50, hr.y() + 35, "click a sprite; takes effect at the next door");
+        y += 48; spriteCells.clear();
+        int cols = (W - 16) / 38, n = kNumSprites + 1;
+        for (int i = 0; i < n; i++)
+        {
+            QRect c(8 + (i % cols) * 38, y + (i / cols) * 40, 36, 38); spriteCells.push_back(c);
+            bool sel = i == 0 ? spriteId < 0 : (cur && kSprites[i - 1].id == cur->id);
+            g.setPen(QPen(sel ? cGold : cBrown.lighter(140), sel ? 2 : 1)); g.setBrush(sel ? cSlot : cSlotDead); g.drawRoundedRect(c.adjusted(1, 1, -1, -1), 4, 4);
+            g.drawImage(c.x() + 2, c.y() + 3, i == 0 ? thumb(nullptr) : thumb(&kSprites[i - 1]));
+        }
+        y += ((n + cols - 1) / cols) * 40 + 4;
+    }
+
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter g(this); g.fillRect(rect(), cBg); QFont f = g.font(); f.setPointSize(10); g.setFont(f);
+        int W = width(), y = 0; auto ps = pairs();
+        qint64 since = peerSeen ? (QDateTime::currentMSecsSinceEpoch() - peerSeen) / 1000 : -1; bool online = since >= 0 && since < 3;
+        QString status = online ? QString(QChar(0x25cf)) + " connected" : since < 0 ? QString(QChar(0x25cb)) + " waiting for friend" : QString(QChar(0x25cb)) + QString(" no signal %1s").arg(since);
+        header(g, y, "HG TOGETHER");
+        g.setPen(online ? cGreen : cYellow); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, status);
+        Boss cap = levelCap(johto, kanto, gameClear); int badges = __builtin_popcount(johto) + __builtin_popcount(kanto);
+        g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 20); g.setPen(cText);
+        g.drawText(QRect(16, y, W - 32, 20), Qt::AlignVCenter, QString("%1 %2 %3  %4  Cap %5 (%6)  %4  %7/16 badges").arg(myName, QChar(0x2194), peerName, QChar(0x00b7)).arg(cap.cap).arg(cap.name).arg(badges));
+        y += 26;
+        tabBar(g, y, ps);
+        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y);
+        pageSoulLink(g, y, ps);
         y += 8;
         if (y != contentHeight) { contentHeight = y; setMinimumHeight(y); }
     }
