@@ -231,10 +231,14 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
         {
             std::string tmp = std::string(path) + ".tmp"; FILE* f = fopen(tmp.c_str(), "w");
             if (f) { for (int i = 0; i < 16; i++) fprintf(f, "R%d=%08X\n", i, nds.ARM9.R[i]); fprintf(f, "CPSR=%08X\n", nds.ARM9.CPSR);
-                for (u32 i = 0; i < 64; i++) { u32 v = 0; nds.ARM9.DataRead32(nds.ARM9.R[13] + 4 * i, &v); fprintf(f, "SP+%02X=%08X\n", 4 * i, v); }
+                // geheugen lezen zonder de CPU (DataRead32 gaat via de MPU en veroorzaakte zelf data aborts in het spel):
+                // DTCM rechtstreeks uit de buffer, de rest via de bus
+                auto rd = [&](u32 a) -> u32 { if ((a & nds.ARM9.DTCMMask) == nds.ARM9.DTCMBase) { u32 v; memcpy(&v, nds.ARM9.DTCM + (a & 0x3FFC), 4); return v; }
+                                             return (a >= 0x02000000 && a < 0x03000000) ? nds.ARM9Read32(a) : 0; };
+                for (u32 i = 0; i < 64; i++) fprintf(f, "SP+%02X=%08X\n", 4 * i, rd(nds.ARM9.R[13] + 4 * i));
                 // gebankte registers: in abort-modus staan hier R13/R14 (SP/LR) van de code die crashte (melonDS wisselt ze om)
                 for (int i = 0; i < 3; i++) fprintf(f, "ABT%d=%08X\nSVC%d=%08X\nIRQ%d=%08X\n", i, nds.ARM9.R_ABT[i], i, nds.ARM9.R_SVC[i], i, nds.ARM9.R_IRQ[i]);
-                for (u32 i = 0; i < 64; i++) { u32 v = 0; nds.ARM9.DataRead32(nds.ARM9.R_ABT[0] + 4 * i, &v); fprintf(f, "ASP+%02X=%08X\n", 4 * i, v); }
+                for (u32 i = 0; i < 64; i++) fprintf(f, "ASP+%02X=%08X\n", 4 * i, rd(nds.ARM9.R_ABT[0] + 4 * i));
                 fclose(f); rename(tmp.c_str(), path); }
         }
         else if (c == 'p' && sscanf(a, "%x %511s", &x, path) == 2) { std::vector<u8> v = hexBytes(path); for (size_t i = 0; i < v.size(); i++) nds.ARM9Write8(x + i, v[i]); }
