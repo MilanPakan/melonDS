@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 
 using namespace melonDS;
 
@@ -20,25 +21,43 @@ namespace
 {
 const uint32_t kFieldSysLiteral = 0x0203E304, kProjMtx = 0x021DA4A4;
 const double kHalfH = 96, kAspect = 4.0 / 3;   // spel: halve hoogte 96 eenheden op de speler, 256x192
-bool parsed = false, on = false; double pitch = 50, fov = 0, zoom = 1;
+bool parsed = false, on = false, env = false, restored = true; double pitch = 50, fov = 0, zoom = 1;
+std::atomic<int> dock{0};   // 1 = diorama via het dock (zonder HGT_CAM)
+// Spelwaarden van de overworld-camera (gemeten, docs/camera.md) om "diorama uit" terug te zetten zonder mapwissel.
+const int32_t kGameCam[5] = {251, 4088, 5461, 614400, 7106560}, kGameDist = 6404251, kGamePosY = 4893873, kGamePosZ = 4123049;
+const int32_t kGameProj[16] = {32, 0, 0, 0, 0, 43, 0, 0, 0, 0, -5, 0, 0, 0, -4871, 4096};
 bool inRam(uint32_t a) { return a >= 0x02000000 && a < 0x02400000; }
 int32_t fx(double v) { return (int32_t)lround(v * 4096); }
 }
+
+void setDiorama(bool d) { dock = d ? 1 : 0; }
+bool envSet() { const char* e = getenv("HGT_CAM"); return e && *e; }
 
 void apply(NDS& nds)
 {
     if (!parsed)
     {
-        parsed = true; const char* e = getenv("HGT_CAM"); if (e && !*e) e = nullptr;
+        parsed = true; const char* e = getenv("HGT_CAM"); if (e && !*e) e = nullptr; env = e;
         on = e && sscanf(e, "%lf,%lf,%lf", &pitch, &fov, &zoom) >= 1 && pitch > 1 && pitch < 89 && fov >= 0 && fov < 120 && zoom > 0;
         if (e) fprintf(stderr, "HGT: camera %s pitch %.0f fov %.0f zoom %.2f\n", on ? "aan" : "ONGELDIG (pitch,fov,zoom)", pitch, fov, zoom);
     }
-    if (!on) return;
+    if (!env) { on = dock == 1; if (on) { pitch = 30; fov = 45; zoom = 1; } }   // dock-stand (docs/camera.md: aanbevolen)
+    if (!on && restored) return;
     uint32_t var = nds.ARM9Read32(kFieldSysLiteral); if (!inRam(var)) return;
     uint32_t fs = nds.ARM9Read32(var);               if (!inRam(fs)) return;
     uint32_t cam = nds.ARM9Read32(fs + 0x24);        if (!inRam(cam)) return;
     // alleen de overworld-camera (ortho, 4:3); cutscenes/menu's met een eigen camera laten we met rust
     if ((int32_t)nds.ARM9Read32(cam + 8) != 5461) return;
+    if (!on)   // net uitgezet: spelcamera één keer terugzetten (het spel herberekent hem zelf pas bij een mapwissel)
+    {
+        for (int i = 0; i < 5; i++) nds.ARM9Write32(cam + 4 * i, kGameCam[i]);
+        int32_t tx = nds.ARM9Read32(cam + 0x20), ty = nds.ARM9Read32(cam + 0x24), tz = nds.ARM9Read32(cam + 0x28);
+        nds.ARM9Write32(cam + 0x14, tx); nds.ARM9Write32(cam + 0x18, ty + kGamePosY); nds.ARM9Write32(cam + 0x1C, tz + kGamePosZ);
+        nds.ARM9Write32(cam + 0x38, kGameDist); nds.ARM9Write16(cam + 0x3C, 56450); nds.ARM9Write8(cam + 0x44, 1);
+        for (int i = 0; i < 16; i++) nds.ARM9Write32(kProjMtx + 4 * i, kGameProj[i]);
+        restored = true; fprintf(stderr, "HGT: camera terug naar het spel\n"); return;
+    }
+    restored = false;
 
     double p = pitch * M_PI / 180, halfH = kHalfH / zoom, tx = (int32_t)nds.ARM9Read32(cam + 0x20) / 4096.0,
            ty = (int32_t)nds.ARM9Read32(cam + 0x24) / 4096.0, tz = (int32_t)nds.ARM9Read32(cam + 0x28) / 4096.0;

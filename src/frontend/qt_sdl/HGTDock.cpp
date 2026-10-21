@@ -8,6 +8,7 @@
 #include "NDS.h"
 #include "HGTGhost.h"
 #include "HGTogether.h"
+#include "HGTCamera.h"
 #include <QPainter>
 #include <QMouseEvent>
 #include <QTimer>
@@ -826,6 +827,9 @@ private:
     // outcome 0 pending/1 caught/2 missed/3 reroll, ts}], dead:[pid], banned:[pid]}}). Missing file = Nuzlocke off.
     struct NzEnc { int area, outcome; qint64 ts; };
     int nzTicks = 0; bool nzOn = false; std::vector<NzEnc> nzEnc[2]; std::vector<uint32_t> nzDead[2]; int mapsec = -1;
+    // View switch (docs/camera.md): diorama camera (HGT_CAM 30,45,1 unless HGT_CAM is set) and sharp view (OpenGL renderer at 4x).
+    // Stored next to the ROM in <rom>.view as "diorama sharp" (0/1 each), applied at start; the launcher has no setting for it.
+    bool viewDiorama = false, viewSharp = false; QRect dioramaRect, sharpRect;
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite, 3 Badges; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
@@ -889,6 +893,39 @@ private:
         QFile f(rom + ".sprite"); if (!getenv("HGT_SPRITE") && f.open(QIODevice::ReadOnly)) spriteMm = f.readAll().trimmed().toInt();
     }
     void saveSprite() { QFile f(romPath() + ".sprite"); if (f.open(QIODevice::WriteOnly)) f.write(QByteArray::number(spriteMm)); }
+
+    void loadView(const QString& rom)
+    {
+        QFile f(rom + ".view"); if (!f.open(QIODevice::ReadOnly)) return;
+        QList<QByteArray> v = f.readAll().simplified().split(' '); if (v.size() < 2) return;
+        viewDiorama = v[0].toInt(); viewSharp = v[1].toInt(); applyView();
+    }
+    void saveView() { QFile f(romPath() + ".view"); if (f.open(QIODevice::WriteOnly)) f.write(QByteArray::number(viewDiorama) + " " + QByteArray::number(viewSharp)); }
+    // Same path as the Video settings dialog: set the global config, then MainWindow::onUpdateVideoSettings(glchange).
+    void applyView()
+    {
+        HGTCamera::setDiorama(viewDiorama);
+        auto& cfg = emu->getGlobalConfig();
+        auto usesGL = [&] { return cfg.GetBool("Screen.UseGL") || cfg.GetInt("3D.Renderer") != 0; };
+        bool oldGL = usesGL(); int oldR = cfg.GetInt("3D.Renderer"), oldS = cfg.GetInt("3D.GL.ScaleFactor"); bool oldU = cfg.GetBool("Screen.UseGL");
+        int r = viewSharp ? 1 : 0, sc = viewSharp ? 4 : oldS; bool u = viewSharp;   // 1 = renderer3D_OpenGL
+        if (r == oldR && sc == oldS && u == oldU) return;
+        cfg.SetInt("3D.Renderer", r); cfg.SetInt("3D.GL.ScaleFactor", sc); cfg.SetBool("Screen.UseGL", u);
+        fprintf(stderr, "HGT: weergave %s\n", viewSharp ? "scherp (OpenGL 4x)" : "standaard (software)");
+        QMetaObject::invokeMethod(window(), "onUpdateVideoSettings", Qt::QueuedConnection, Q_ARG(bool, oldGL != usesGL()));
+    }
+    void viewRow(QPainter& g, int& y)
+    {
+        int W = width(); QFont f = g.font(); f.setPointSize(9); g.setFont(f);
+        bool env = HGTCamera::envSet();
+        auto pill = [&](QRect r, bool on, const QString& text) {
+            g.setPen(QPen(on ? cGold : cHead.darker(130), 2)); g.setBrush(on ? cSlot : cHead); g.drawRoundedRect(r.adjusted(1, 1, -1, -1), 8, 8);
+            g.setPen(on ? cText : cWhite); g.drawText(r, Qt::AlignCenter, QString("%1 %2").arg(QChar(on ? 0x25cf : 0x25cb)).arg(text)); };
+        g.setPen(cWhite); g.drawText(QRect(12, y, 50, 22), Qt::AlignVCenter, "View");
+        dioramaRect = QRect(60, y, (W - 72) / 2 - 4, 22); sharpRect = QRect(dioramaRect.right() + 8, y, (W - 72) / 2 - 4, 22);
+        pill(dioramaRect, env || viewDiorama, env ? "Diorama (HGT_CAM)" : "Diorama"); pill(sharpRect, viewSharp, "Sharp 4x");
+        f.setPointSize(10); g.setFont(f); y += 28;
+    }
 
     void loadNuzlocke()
     {
@@ -974,10 +1011,12 @@ private:
     void poll()
     {
         NDS* nds = emu->getNDS(); if (!nds) return;
-        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); badges.narc.load(rom, {"a", "0", "4", "9"}); } }
+        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); loadView(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); badges.narc.load(rom, {"a", "0", "4", "9"}); } }
         if (readParty(*nds)) updateLog();
         if (mapId >= 0 && mapId < 540) mapsec = nds->ARM9Read8(0x020F6BE0 + mapId * 0x18 + 18);   // map header -> mapsec, as HGTNuzlocke
         if (nzTicks++ % 8 == 0) loadNuzlocke();   // every 2 s
+        // headless test of the runtime path: HGT_DOCK_TOGGLE=<s> flips both view switches once after <s> seconds (as a click would)
+        if (const char* t = getenv("HGT_DOCK_TOGGLE")) if (nzTicks == atoi(t) * 4) { viewDiorama = !viewDiorama; viewSharp = !viewSharp; saveView(); applyView(); }
         applySprite(*nds);
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
@@ -1023,6 +1062,8 @@ private:
 
     void mousePressEvent(QMouseEvent* e) override
     {
+        if (dioramaRect.contains(e->pos()) && !HGTCamera::envSet()) { viewDiorama = !viewDiorama; saveView(); applyView(); update(); return; }
+        if (sharpRect.contains(e->pos())) { viewSharp = !viewSharp; saveView(); applyView(); update(); return; }
         for (int i = 0; i < (int)tabRects.size(); i++) if (tabRects[i].contains(e->pos())) { page = page == i + 1 ? 0 : i + 1; update(); return; }   // click again = close
         if (page != 2) return;
         for (int i = 0; i < (int)spriteCells.size(); i++)
@@ -1277,6 +1318,7 @@ private:
                        .arg(p.connected ? QString("%1s ago").arg(p.since, 0, 'f', 1) : QString("no signal %1s").arg((int)p.since)));
             y += 20;
         }
+        viewRow(g, y);
         nuzlockeBox(g, y);
         pageSoulLink(g, y, ps);
         y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
