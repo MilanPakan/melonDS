@@ -5,6 +5,7 @@
 // shortcut: één peer, geen handshake, plain UDP; upgraden naar ENet/relay zodra de launcher (fase 3) er is.
 #include "HGTogether.h"
 #include "HGTGhost.h"
+#include "HGTCamera.h"
 #include "EmuInstance.h"
 #include "NDS.h"
 #include "GPU.h"
@@ -350,6 +351,7 @@ void HGTogether::tick(EmuInstance* emu)
             fprintf(stderr, "HGT: ander start trainerbattle %u -> joiner-script %u\n", peerBattle.trainer, call.a[1]);
         }
     }
+    HGTCamera::apply(nds);   // camera-experiment (HGT_CAM), vóór de ghost zodat die dezelfde camera leest
     bool haveMe = readState(nds, me); me.frame = frame;
     if (haveMe) exchange();
     void* top = nullptr; void* bottom = nullptr;

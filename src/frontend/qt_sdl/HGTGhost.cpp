@@ -57,7 +57,7 @@ void init(const std::string& romPath)
 
 namespace
 {
-struct Cam { double pos[3], f[3], s[3], u[3], cot, aspect; };
+struct Cam { double pos[3], f[3], s[3], u[3], cot, aspect, halfH; bool ortho; };
 void v3(NDS& nds, uint32_t a, double* o) { for (int k = 0; k < 3; k++) o[k] = (int32_t)nds.ARM9Read32(a + 4 * k) / 4096.0; }
 void cross(const double* a, const double* b, double* o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
 double dot(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
@@ -71,6 +71,7 @@ bool readCam(NDS& nds, Cam& c)   // Camera: perspective {fovySin, fovyCos, aspec
     int32_t fsin = nds.ARM9Read32(cam), fcos = nds.ARM9Read32(cam + 4), asp = nds.ARM9Read32(cam + 8);
     if (fsin <= 0 || asp <= 0) return false;
     c.cot = (double)fcos / fsin; c.aspect = asp / 4096.0;
+    c.ortho = nds.ARM9Read8(cam + 0x44) == 1; c.halfH = (double)fsin / fcos * ((int32_t)nds.ARM9Read32(cam + 0x38) / 4096.0);   // ortho: halve hoogte = tan * distance
     double target[3], up[3]; v3(nds, cam + 0x14, c.pos); v3(nds, cam + 0x20, target); v3(nds, cam + 0x2C, up);
     for (int k = 0; k < 3; k++) c.f[k] = target[k] - c.pos[k];
     if (!norm(c.f)) return false;
@@ -81,6 +82,7 @@ bool project(const Cam& c, const int32_t* p, double& sx, double& sy, double& w) 
 {
     double v[3] = { p[0] / 4096.0 - c.pos[0], p[1] / 4096.0 - c.pos[1], p[2] / 4096.0 - c.pos[2] };
     w = dot(c.f, v); if (w <= 0.01) return false;
+    if (c.ortho) { sx = 128 + 128 * dot(c.s, v) / (c.halfH * c.aspect); sy = 96 - 96 * dot(c.u, v) / c.halfH; return true; }
     sx = 128 + 128 * dot(c.s, v) * c.cot / c.aspect / w;
     sy = 96 - 96 * dot(c.u, v) * c.cot / w;
     return true;
@@ -126,7 +128,7 @@ void draw(u32* fb, NDS& nds, int idx, const int32_t me[3], const int32_t pos[3],
     // projectie: eigen speler ijkt de textuur-offset en de schaal (1 texel = 1 px op de diepte van de speler)
     Cam cam; double mx, my, mw, gx, gy, gw;
     if (!readCam(nds, cam) || !project(cam, me, mx, my, mw) || !project(cam, pos, gx, gy, gw)) return;
-    double sc = mw / gw; int size = (int)lround(32 * sc); if (size < 2 || size > 128) return;
+    double sc = cam.ortho ? 1 : mw / gw; int size = (int)lround(32 * sc); if (size < 2 || size > 128) return;
     int ox = (int)lround(gx + (kTexX - mx) * sc), oy = (int)lround(gy + (kTexY - my) * sc);
     // Dieptebuffer (W-buffering) = k * kijkdiepte; k ijken op de eigen billboard (torso-pixel), want de hardware-W is ~2.24x de
     // lookAt-diepte (oorzaak niet gevonden; NNS_G3dGlbPerspective zou scaleW=1 geven). Geen 3D-pixel daar -> geen occlusie.

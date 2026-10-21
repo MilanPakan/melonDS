@@ -19,6 +19,9 @@
 #include <QFile>
 #include <QHostAddress>
 #include <QDateTime>
+#include <QGuiApplication>
+#include <QMainWindow>
+#include <QScreen>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -760,7 +763,7 @@ private:
     Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite; Soul Link is always shown
-    Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0;
+    Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
     // --- data ---
     bool readParty(NDS& nds)
@@ -862,6 +865,14 @@ private:
         applySprite(*nds);
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
+        // camera test (emulator/test-cam.sh): the game area as the X server shows it, so it also works with the OpenGL renderer
+        if (const char* d = getenv("HGT_SCREEN_DUMP")) if (++shotTicks % 8 == 0)
+            if (auto* mw = qobject_cast<QMainWindow*>(window()); mw && mw->centralWidget())
+            {
+                if (shotTicks == 8) mw->resize(1024 + 400, 768 + 40);   // top screen at 4x next to the dock
+                QWidget* c = mw->centralWidget(); QPoint o = c->mapTo(mw, QPoint(0, 0));
+                QGuiApplication::primaryScreen()->grabWindow(mw->winId(), o.x(), o.y(), c->width(), c->height()).save(QString("%1/shot-%2.png").arg(d).arg(shotTicks / 8, 3, 10, QChar('0')));
+            }
     }
 
     // --- trainer sprite ---
