@@ -57,7 +57,8 @@ struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, start
 
 bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
 std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-thread) leest ze
-int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
+// calm: ARM9 wacht op vblank (spel niet midden in zijn werk)
+int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false, calm = false, partyDue = false; uint32_t calmTicks = 0, allTicks = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
 bool curEligible = false; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
@@ -388,7 +389,7 @@ void watchBattleParty(NDS& nds, uint32_t setup)
 void watchEncounter(NDS& nds, uint32_t fs)
 {
     uint32_t setup = fs ? encounterSetup(nds, fs) : 0;
-    if (setup) watchBattleParty(nds, setup);   // ook trainerbattles
+    if (setup && calm) watchBattleParty(nds, setup);   // ook trainerbattles; alleen als het spel stilstaat
     if (setup && (setup != bagHidden || frame % 30 == 0)) bagHide(nds, setup);
     if (curSetup && setup != curSetup) { finish(0); return; }   // setup weg zonder winFlag (blackout-pad): gemist
     if (!setup) { doneSetup = 0; return; }   // heap hergebruikt hetzelfde adres voor de volgende battle
@@ -487,7 +488,8 @@ void HGTNuzlocke::tick(EmuInstance* emu)
     if (!initDone) init(emu->baseROMDir + "/" + emu->baseROMName);
     if (!enabled || !emu->getNDS()) return;
     frame++; NDS& nds = *emu->getNDS();
-    if (frame % 1800 == 0) nzlog("leeft (party %u, encs %zu, dood %zu)", me.nParty, me.encs.size(), me.dead.size());
+    calm = nds.ARM9.Halted != 0; allTicks++; calmTicks += calm;
+    if (frame % 1800 == 0) nzlog("leeft (party %u, encs %zu, dood %zu, rustig %u%%)", me.nParty, me.encs.size(), me.dead.size(), allTicks ? calmTicks * 100 / allTicks : 0);
     uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0; if (!inRam(fs)) fs = 0;
     if (fs) { uint32_t sd = nds.ARM9Read32(fs + 0xC); if (inRam(sd)) saveData = sd; }   // in battle is FS NULL: SaveData-pointer bewaren
     if (saveData && nds.ARM9Read32(saveData + 0x23014 + 2 * 0x10) != 2) saveData = 0;
@@ -499,7 +501,10 @@ void HGTNuzlocke::tick(EmuInstance* emu)
         watchEncounter(nds, fieldSys);   // de taakketen leeft in het FieldSystem, ook als de pointer tijdens de battle NULL is
         bool idle = fs && nds.ARM9Read32(fs + 0x10) == 0 && nds.ARM9Read32(fs + 0x6C) == 1 && !curSetup && inRam(nds.ARM9Read32(fs)) && nds.ARM9Read32(nds.ARM9Read32(fs) + 8) == 0;   // + [[FS]+8] isPaused == 0 (geen menu/app open)
         if (idle && bagHeld) bagRestore(nds);   // na de terugschrijf van de battle-tas
-        if (frame % 8 == 0) { updateLinks(); watchParty(nds, fs, idle); }
+        // Party alleen lezen/schrijven als de ARM9 stilstaat (wacht op vblank). melonDS stopt een frame op een vast aantal cycli, ook als het spel
+        // dan midden in het (ont)sleutelen van een record zit: dat gaf op de bench steeds dezelfde halve record ("Totodile Lv105, HP 51119").
+        if (frame % 8 == 0) partyDue = true;
+        if (partyDue && calm) { partyDue = false; updateLinks(); watchParty(nds, fs, idle); }
     }
     exchange();
     if (dirty && frame % 15 == 0) save();
