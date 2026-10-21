@@ -3,7 +3,9 @@
 // Perspectief: projectie via de spelcamera (Camera op FieldSystem+0x24, zelfde lookAt/fovy als NNS_G3dGlb); occlusie: pixels waar de
 // dieptebuffer (W-buffering = kijkdiepte in fx32) dichterbij ligt dan de ghost min een halve tegel.
 // OpenGL-renderer: het vlak rond de ghost wordt uit de uitvoertextuur van het bovenscherm teruggelezen (glReadPixels), op de interne
-// resolutie (schaal S, nearest-neighbour) gemengd en teruggeschreven, vóór drawScreen op dezelfde emu-thread. Geen occlusie onder GL.
+// resolutie (schaal S, nearest-neighbour) overschreven en teruggeschreven, vóór drawScreen op dezelfde emu-thread. Occlusie onder GL:
+// de 3D-renderer schrijft gl_FragDepth = DS-diepte / 2^24, dus de dieptetextuur van zijn MainFramebuffer heeft dezelfde schaal als de
+// software-dieptebuffer; we lezen het vlak terug en ijken k op dezelfde manier.
 // shortcut: ren-cyclus op de eigen frameteller i.p.v. de echte animatiefase; max 8 peers met eigen loopfase.
 #include "HGTGhost.h"
 #include "NDS.h"
@@ -11,6 +13,7 @@
 #include "GPU3D_Soft.h"
 #ifdef OGLRENDERER_ENABLED
 #include "OpenGLSupport.h"
+#include "GPU3D_OpenGL.h"
 #endif
 #include <vector>
 #include <cmath>
@@ -142,13 +145,10 @@ void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int
     double sc = cam.ortho ? 1 : mw / gw, size = 32 * sc; if (size < 2 || size > 128) return;
     double ox = gx + (kTexX - mx) * sc, oy = gy + (kTexY - my) * sc;   // textuur-oorsprong in DS-pixels
     // Dieptebuffer (W-buffering) = k * kijkdiepte; k ijken op de eigen billboard (torso-pixel), want de hardware-W is ~2.24x de
-    // lookAt-diepte (oorzaak niet gevonden). Geen 3D-pixel daar of geen software-renderer -> geen occlusie.
+    // lookAt-diepte (oorzaak niet gevonden). Geen 3D-pixel daar -> geen occlusie. Software: DepthBuffer; OpenGL: dieptetextuur (zie boven).
     auto* r3d = cpu ? dynamic_cast<SoftRenderer3D*>(&nds.GPU.GetRenderer().Get3DRenderer()) : nullptr;
-    uint32_t dme = r3d ? r3d->GetDepth(128, 88) : 0; double k = dme && dme < 0xFFFFFF ? dme / mw : 0;
-    uint32_t gdepth = (uint32_t)(k * (gw - 8));   // min een halve tegel: de onderrand van de textuur ligt vóór het positiepunt
-    if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f %s\n", gw, mw, sc, k / 4096, cpu ? "software" : "opengl");
-
-    Target t{}; std::vector<u32> buf;
+    uint32_t dme = r3d ? r3d->GetDepth(128, 88) : 0;
+    Target t{}; std::vector<u32> buf; std::vector<float> depth;   // depth: GL-diepte van het vlak (0..1), leeg = geen GL-occlusie
 #ifdef OGLRENDERER_ENABLED
     GLuint glTex = 0; GLint prevFb = 0, prevTex = 0;
 #endif
@@ -170,11 +170,21 @@ void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int
         glReadBuffer(GL_COLOR_ATTACHMENT0);
         glPixelStorei(GL_PACK_ALIGNMENT, 4); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glReadPixels(t.x0, t.y0, t.w, t.h, GL_RGBA, GL_UNSIGNED_BYTE, t.px);
+        if (auto* g3d = dynamic_cast<GLRenderer3D*>(&nds.GPU.GetRenderer().Get3DRenderer()); g3d && g3d->GetScaleFactor() == S)
+        {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d->GetMainFramebuffer());
+            float me1 = 1; glReadPixels(128 * S + S / 2, 88 * S + S / 2, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &me1);
+            dme = (uint32_t)(me1 * 16777216.0);
+            depth.resize(buf.size()); glReadPixels(t.x0, t.y0, t.w, t.h, GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
+        }
 #else
         return;
 #endif
     }
 
+    double k = dme && dme < 0xFFFFFF ? dme / mw : 0;
+    uint32_t gdepth = (uint32_t)(k * (gw - 8));   // min een halve tegel: de onderrand van de textuur ligt vóór het positiepunt
+    if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f %s x%d\n", gw, mw, sc, k / 4096, cpu ? "software" : depth.empty() ? "opengl zonder diepte" : "opengl", t.S);
     const uint8_t* fr = d + tex + fi * 512; bool mirror = facing == 3; int S = t.S;
     for (int Y = (int)ceil(oy * S); Y < (int)ceil((oy + size) * S); Y++)
         for (int X = (int)ceil(ox * S); X < (int)ceil((ox + size) * S); X++)
@@ -183,10 +193,10 @@ void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int
             int x = (int)(((X + 0.5) / S - ox) / sc), y = (int)(((Y + 0.5) / S - oy) / sc);   // texel, nearest-neighbour
             if (x < 0 || y < 0 || x > 31 || y > 31) continue; if (mirror) x = 31 - x;
             int b = fr[(y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
-            if (k && r3d->GetDepth(X, Y) < gdepth) continue;   // iets staat ervoor (alleen software, S = 1)
+            if (k && (r3d ? r3d->GetDepth(X, Y) : (uint32_t)(depth[(size_t)(p - t.px)] * 16777216.0)) < gdepth) continue;   // iets staat ervoor
             uint16_t col; memcpy(&col, d + pal + c * 2, 2);
             u32 src = rgb(t, (col & 31) * 255 / 31, ((col >> 5) & 31) * 255 / 31, ((col >> 10) & 31) * 255 / 31);
-            *p = (((src >> 1) & 0x7F7F7F7F) + ((*p >> 1) & 0x7F7F7F7F)) | 0xFF000000 | 0x00200020;   // 50/50 + paarse zweem (R en B in beide volgordes)
+            *p = src;   // ondoorzichtig, net als de eigen sprite (wens Milan 2026-10-21)
         }
     label(t, peer.name, (int)lround(ox + size / 2), (int)lround(oy) - 4);
 
