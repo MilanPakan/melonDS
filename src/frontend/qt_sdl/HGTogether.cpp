@@ -124,14 +124,14 @@ void exchange()
     }
 }
 
-void drawGhosts(u32* fb, NDS& nds)
+void drawGhosts(void* top, bool cpu, NDS& nds)
 {
     int32_t mine[3] = { me.px, me.info.py, me.pz };
     for (size_t i = 0; i < peers.size(); i++)
     {
         const State& p = peers[i].st; if (p.mapId != me.mapId || frame - peers[i].seen >= kPeerTimeout) continue;
         int32_t pos[3] = { p.px, p.info.py, p.pz };
-        HGTGhost::draw(fb, nds, (int)i, mine, pos, p.facing, frame, p.info);   // sprite + naam van de ander (HGTGhost.cpp)
+        HGTGhost::draw(top, cpu, nds, (int)i, mine, pos, p.facing, frame, p.info);   // sprite + naam van de ander (HGTGhost.cpp)
     }
 }
 
@@ -355,9 +355,10 @@ void HGTogether::tick(EmuInstance* emu)
     bool haveMe = readState(nds, me); me.frame = frame;
     if (haveMe) exchange();
     void* top = nullptr; void* bottom = nullptr;
-    if (!nds.GPU.GetFramebuffers(&top, &bottom) || !top) return;
+    bool cpu = nds.GPU.GetFramebuffers(&top, &bottom); if (!top) return;   // false = OpenGL: top = &GLuint van de uitvoertextuur
+    if (haveMe) drawGhosts(top, cpu, nds);
+    if (!cpu) return;
     u32* fb = (u32*)top;
-    if (haveMe) drawGhosts(fb, nds);
     if (!dumpDir.empty() && frame % 60 == 0)
     {
         dump(fb);

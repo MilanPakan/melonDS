@@ -2,11 +2,17 @@
 // ROM-bestand op schijf (NARC a/0/8/1), frame-tabel + timing uit docs/fase1-sprites.md.
 // Perspectief: projectie via de spelcamera (Camera op FieldSystem+0x24, zelfde lookAt/fovy als NNS_G3dGlb); occlusie: pixels waar de
 // dieptebuffer (W-buffering = kijkdiepte in fx32) dichterbij ligt dan de ghost min een halve tegel.
+// OpenGL-renderer: het vlak rond de ghost wordt uit de uitvoertextuur van het bovenscherm teruggelezen (glReadPixels), op de interne
+// resolutie (schaal S, nearest-neighbour) gemengd en teruggeschreven, vóór drawScreen op dezelfde emu-thread. Geen occlusie onder GL.
 // shortcut: ren-cyclus op de eigen frameteller i.p.v. de echte animatiefase; max 8 peers met eigen loopfase.
 #include "HGTGhost.h"
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_Soft.h"
+#ifdef OGLRENDERER_ENABLED
+#include "OpenGLSupport.h"
+#endif
+#include <vector>
 #include <cmath>
 #include <algorithm>
 #include <cctype>
@@ -34,16 +40,21 @@ const char* kFont[36] = {
     "101101110101101", "100100100100111", "101111111101101", "110101101101101", "111101101101111", "111101111100100", "111101101111001", "110101110101101", "111100111001111", "111010010010010",
     "101101101101111", "101101101101010", "101101111111101", "101101010101101", "101101010010010", "111001010100111" };
 
-void put(u32* fb, int x, int y, u32 c) { if (x >= 0 && x < 256 && y >= 0 && y < 192) fb[y * 256 + x] = c; }
+// Tekendoel: CPU-framebuffer (BGRA, 256x192, S=1) of een teruggelezen vlak uit de GL-uitvoertextuur (RGBA, schaal S).
+// Coördinaten X,Y zijn uitvoerpixels (DS-pixel × S); px dekt [x0,x0+w) × [y0,y0+h).
+struct Target { u32* px; int x0, y0, w, h, S; bool rgba; };
+u32* at(Target& t, int X, int Y) { X -= t.x0; Y -= t.y0; return X < 0 || Y < 0 || X >= t.w || Y >= t.h ? nullptr : &t.px[Y * t.w + X]; }
+u32 rgb(const Target& t, u32 r, u32 g, u32 b) { return 0xFF000000 | (t.rgba ? b << 16 | g << 8 | r : r << 16 | g << 8 | b); }
+void block(Target& t, int x, int y, u32 c) { for (int j = 0; j < t.S; j++) for (int i = 0; i < t.S; i++) if (u32* p = at(t, x * t.S + i, y * t.S + j)) *p = c; }   // één DS-pixel
 
-void label(u32* fb, const char* name, int cx, int y)
+void label(Target& t, const char* name, int cx, int y)
 {
     int n = (int)strnlen(name, 8); int x = cx - n * 2;
     for (int i = 0; i < n; i++, x += 4)
     {
         char c = toupper((unsigned char)name[i]); int g = isdigit((unsigned char)c) ? c - '0' : (c >= 'A' && c <= 'Z') ? 10 + c - 'A' : -1;
         if (g < 0) continue;
-        for (int r = 0; r < 5; r++) for (int b = 0; b < 3; b++) if (kFont[g][r * 3 + b] == '1') { put(fb, x + b + 1, y + r + 1, 0xFF000000); put(fb, x + b, y + r, 0xFFFFFFFF); }
+        for (int r = 0; r < 5; r++) for (int b = 0; b < 3; b++) if (kFont[g][r * 3 + b] == '1') { block(t, x + b + 1, y + r + 1, 0xFF000000); block(t, x + b, y + r, 0xFFFFFFFF); }
     }
 }
 }
@@ -102,7 +113,7 @@ void readInfo(NDS& nds, Info& i)
     i.gender = nds.ARM9Read8(prof + 0x18);
 }
 
-void draw(u32* fb, NDS& nds, int idx, const int32_t me[3], const int32_t pos[3], int facing, uint32_t frame, const Info& peer)
+void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int32_t pos[3], int facing, uint32_t frame, const Info& peer)
 {
     if (idx < 0 || idx >= 8) return;
     int32_t px = pos[0], pz = pos[2];
@@ -128,27 +139,63 @@ void draw(u32* fb, NDS& nds, int idx, const int32_t me[3], const int32_t pos[3],
     // projectie: eigen speler ijkt de textuur-offset en de schaal (1 texel = 1 px op de diepte van de speler)
     Cam cam; double mx, my, mw, gx, gy, gw;
     if (!readCam(nds, cam) || !project(cam, me, mx, my, mw) || !project(cam, pos, gx, gy, gw)) return;
-    double sc = cam.ortho ? 1 : mw / gw; int size = (int)lround(32 * sc); if (size < 2 || size > 128) return;
-    int ox = (int)lround(gx + (kTexX - mx) * sc), oy = (int)lround(gy + (kTexY - my) * sc);
+    double sc = cam.ortho ? 1 : mw / gw, size = 32 * sc; if (size < 2 || size > 128) return;
+    double ox = gx + (kTexX - mx) * sc, oy = gy + (kTexY - my) * sc;   // textuur-oorsprong in DS-pixels
     // Dieptebuffer (W-buffering) = k * kijkdiepte; k ijken op de eigen billboard (torso-pixel), want de hardware-W is ~2.24x de
-    // lookAt-diepte (oorzaak niet gevonden; NNS_G3dGlbPerspective zou scaleW=1 geven). Geen 3D-pixel daar -> geen occlusie.
-    auto* r3d = dynamic_cast<SoftRenderer3D*>(&nds.GPU.GetRenderer().Get3DRenderer());
+    // lookAt-diepte (oorzaak niet gevonden). Geen 3D-pixel daar of geen software-renderer -> geen occlusie.
+    auto* r3d = cpu ? dynamic_cast<SoftRenderer3D*>(&nds.GPU.GetRenderer().Get3DRenderer()) : nullptr;
     uint32_t dme = r3d ? r3d->GetDepth(128, 88) : 0; double k = dme && dme < 0xFFFFFF ? dme / mw : 0;
     uint32_t gdepth = (uint32_t)(k * (gw - 8));   // min een halve tegel: de onderrand van de textuur ligt vóór het positiepunt
-    if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f\n", gw, mw, sc, k / 4096);
-    const uint8_t* fr = d + tex + fi * 512; bool mirror = facing == 3;
-    for (int ty = 0; ty < size; ty++)
-        for (int tx = 0; tx < size; tx++)
+    if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f %s\n", gw, mw, sc, k / 4096, cpu ? "software" : "opengl");
+
+    Target t{}; std::vector<u32> buf;
+#ifdef OGLRENDERER_ENABLED
+    GLuint glTex = 0; GLint prevFb = 0, prevTex = 0;
+#endif
+    if (cpu) t = { (u32*)top, 0, 0, 256, 192, 1, false };
+    else
+    {
+#ifdef OGLRENDERER_ENABLED
+        glTex = *(GLuint*)top;   // GLRenderer::GetFramebuffers: &FPOutputTex[front], array-textuur, laag 0 = bovenscherm
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevFb); glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &prevTex);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, glTex); GLint W = 0; glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_WIDTH, &W);
+        int S = std::max(1, (int)W / 256), lab = std::max(0.0, 16 - size / 2) + 2;   // labelbreedte tot 28 px rond het midden
+        int x0 = std::max(0, (int)floor((ox - lab) * S)), x1 = std::min(256 * S, (int)ceil((ox + size + lab) * S));
+        int y0 = std::max(0, (int)floor((oy - 6) * S)), y1 = std::min(192 * S, (int)ceil((oy + size) * S));
+        if (x1 <= x0 || y1 <= y0) { glBindTexture(GL_TEXTURE_2D_ARRAY, prevTex); return; }
+        t = { nullptr, x0, y0, x1 - x0, y1 - y0, S, true }; buf.resize((size_t)t.w * t.h); t.px = buf.data();
+        static GLuint fbo = 0; if (!fbo) glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, glTex, 0, 0);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glReadPixels(t.x0, t.y0, t.w, t.h, GL_RGBA, GL_UNSIGNED_BYTE, t.px);
+#else
+        return;
+#endif
+    }
+
+    const uint8_t* fr = d + tex + fi * 512; bool mirror = facing == 3; int S = t.S;
+    for (int Y = (int)ceil(oy * S); Y < (int)ceil((oy + size) * S); Y++)
+        for (int X = (int)ceil(ox * S); X < (int)ceil((ox + size) * S); X++)
         {
-            int sx = ox + tx, sy = oy + ty; if (sx < 0 || sx >= 256 || sy < 0 || sy >= 192) continue;
-            int x = (int)(tx / sc), y = (int)(ty / sc); if (x > 31 || y > 31) continue; if (mirror) x = 31 - x;
+            u32* p = cpu && (X < 0 || X >= 256 || Y < 0 || Y >= 192) ? nullptr : at(t, X, Y); if (!p) continue;
+            int x = (int)(((X + 0.5) / S - ox) / sc), y = (int)(((Y + 0.5) / S - oy) / sc);   // texel, nearest-neighbour
+            if (x < 0 || y < 0 || x > 31 || y > 31) continue; if (mirror) x = 31 - x;
             int b = fr[(y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
-            if (k && r3d->GetDepth(sx, sy) < gdepth) continue;   // iets staat ervoor
+            if (k && r3d->GetDepth(X, Y) < gdepth) continue;   // iets staat ervoor (alleen software, S = 1)
             uint16_t col; memcpy(&col, d + pal + c * 2, 2);
-            u32 src = ((col & 31) * 255 / 31) << 16 | (((col >> 5) & 31) * 255 / 31) << 8 | (((col >> 10) & 31) * 255 / 31);
-            u32 dst = fb[sy * 256 + sx];
-            fb[sy * 256 + sx] = (((src >> 1) & 0x7F7F7F7F) + ((dst >> 1) & 0x7F7F7F7F)) | 0xFF000000 | 0x00200020;   // 50/50 + paarse zweem
+            u32 src = rgb(t, (col & 31) * 255 / 31, ((col >> 5) & 31) * 255 / 31, ((col >> 10) & 31) * 255 / 31);
+            *p = (((src >> 1) & 0x7F7F7F7F) + ((*p >> 1) & 0x7F7F7F7F)) | 0xFF000000 | 0x00200020;   // 50/50 + paarse zweem (R en B in beide volgordes)
         }
-    label(fb, peer.name, ox + size / 2, oy - 4);
+    label(t, peer.name, (int)lround(ox + size / 2), (int)lround(oy) - 4);
+
+#ifdef OGLRENDERER_ENABLED
+    if (!cpu)
+    {
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, t.x0, t.y0, 0, t.w, t.h, 1, GL_RGBA, GL_UNSIGNED_BYTE, t.px);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFb); glBindTexture(GL_TEXTURE_2D_ARRAY, prevTex);
+    }
+#endif
 }
 }
