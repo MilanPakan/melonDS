@@ -41,6 +41,7 @@ public:
     void SetScaleFactor(int scale) noexcept;
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
+    [[nodiscard]] GLuint GetMainFramebuffer() const noexcept { return MainFramebuffer; }   // HG-Together: dieptebuffer voor de ghost-occlusie
 
     void RenderFrame() override;
     u32* GetLine(int line) override;

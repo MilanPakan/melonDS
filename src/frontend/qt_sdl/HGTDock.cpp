@@ -6,7 +6,8 @@
 #include "HGTDock.h"
 #include "EmuInstance.h"
 #include "NDS.h"
-#include "Config.h"
+#include "HGTGhost.h"
+#include "HGTogether.h"
 #include <QPainter>
 #include <QMouseEvent>
 #include <QTimer>
@@ -18,6 +19,9 @@
 #include <QFile>
 #include <QHostAddress>
 #include <QDateTime>
+#include <QGuiApplication>
+#include <QMainWindow>
+#include <QScreen>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -610,15 +614,6 @@ void decrypt(uint8_t* d, int len, uint32_t seed)
     }
 }
 
-char dsChar(uint16_t c)   // HGSS charmap: digits 0x121, A 0x12B, a 0x145, space 0x1DE
-{
-    if (c >= 0x121 && c <= 0x12A) return '0' + (c - 0x121);
-    if (c >= 0x12B && c <= 0x144) return 'A' + (c - 0x12B);
-    if (c >= 0x145 && c <= 0x15E) return 'a' + (c - 0x145);
-    if (c == 0x1DE) return ' ';
-    return '?';
-}
-
 bool readMon(NDS& nds, uint32_t a, Mon& m)
 {
     uint8_t raw[0xEC]; for (int i = 0; i < 0xEC; i++) raw[i] = nds.ARM9Read8(a + i);
@@ -631,57 +626,19 @@ bool readMon(NDS& nds, uint32_t a, Mon& m)
     memset(&m, 0, sizeof m); m.pid = pid;
     memcpy(&m.species, blk(0), 2);
     uint32_t ivs; memcpy(&ivs, blk(1) + 0x10, 4); m.egg = (ivs >> 30) & 1;
-    for (int i = 0; i < 10; i++) { uint16_t c; memcpy(&c, blk(2) + 2 * i, 2); if (c == 0xFFFF) break; m.nick[i] = dsChar(c); }
+    for (int i = 0; i < 10; i++) { uint16_t c; memcpy(&c, blk(2) + 2 * i, 2); if (c == 0xFFFF) break; m.nick[i] = HGTGhost::dsChar(c); }
     uint8_t party[0x64]; memcpy(party, raw + 0x88, 0x64); decrypt(party, 0x64, pid);
     m.level = party[4]; memcpy(&m.hp, party + 6, 2); memcpy(&m.maxhp, party + 8, 2);
     return true;
 }
 
 // --- ROM icon sprites (a/0/2/0 = poke_icon.narc: file 0 NCLR, file 7+ NCGR 32x64 4bpp, two frames) ---
-// One NARC from the player's ROM (FNT walk by path), kept in memory.
-struct Narc
-{
-    std::vector<uint8_t> data; std::vector<std::pair<uint32_t, uint32_t>> fat; uint32_t gmif = 0, base = 0;   // base = ROM offset of the NARC
-    static uint32_t u32(const QByteArray& b, int o) { uint32_t v; memcpy(&v, b.constData() + o, 4); return v; }
-    static uint16_t u16(const QByteArray& b, int o) { uint16_t v; memcpy(&v, b.constData() + o, 2); return v; }
-
-    void load(const QString& romPath, std::initializer_list<const char*> parts)
-    {
-        QFile f(romPath); if (!f.open(QIODevice::ReadOnly)) return;
-        f.seek(0x40); QByteArray hdr = f.read(16); uint32_t fntOff = u32(hdr, 0), fntLen = u32(hdr, 4), fatOff = u32(hdr, 8), fatLen = u32(hdr, 12);
-        f.seek(fntOff); QByteArray fnt = f.read(fntLen); f.seek(fatOff); QByteArray fatb = f.read(fatLen);
-        int dir = 0xF000;
-        for (const char* part : parts)
-        {
-            uint32_t sub = u32(fnt, (dir & 0xFFF) * 8); int fid = u16(fnt, (dir & 0xFFF) * 8 + 4); int p = sub, next = -1;
-            while (true)
-            {
-                int n = (uint8_t)fnt[p++]; if (!n) break;
-                QByteArray name = fnt.mid(p, n & 0x7F); p += n & 0x7F;
-                if (n & 0x80) { int s = u16(fnt, p); p += 2; if (name == part) { next = s; break; } }
-                else { if (name == part) { next = fid; break; } fid++; }
-            }
-            if (next < 0) return;
-            dir = next;
-        }
-        uint32_t s = u32(fatb, dir * 8), e = u32(fatb, dir * 8 + 4);
-        f.seek(s); QByteArray d = f.read(e - s); if (!d.startsWith("NARC")) return;
-        base = s;
-        uint32_t n = u32(d, 0x18);
-        for (uint32_t i = 0; i < n; i++) fat.push_back({u32(d, 0x1C + i * 8), u32(d, 0x20 + i * 8)});
-        uint32_t btnf = 0x1C + n * 8; gmif = btnf + u32(d, btnf + 4) + 8;
-        data.assign(d.begin(), d.end());
-    }
-
-    const uint8_t* file(int i, uint32_t& len) const { if (i < 0 || i >= (int)fat.size()) { len = 0; return nullptr; } len = fat[i].second - fat[i].first; return data.data() + gmif + fat[i].first; }
-    uint32_t romOffset(int i) const { return base + gmif + fat[i].first; }
-};
 
 static QRgb bgr555(const uint8_t* p) { uint16_t c; memcpy(&c, p, 2); return qRgb((c & 31) * 255 / 31, ((c >> 5) & 31) * 255 / 31, ((c >> 10) & 31) * 255 / 31); }
 
 struct Icons   // party icons: NARC a/0/2/0 (NCLR member 0, NCGR per species)
 {
-    Narc narc; std::map<int, QImage> cache;
+    HGTGhost::Narc narc; std::map<int, QImage> cache;
 
     QImage get(int species, bool egg)
     {
@@ -708,25 +665,14 @@ struct Icons   // party icons: NARC a/0/2/0 (NCLR member 0, NCGR per species)
 // Overworld trainer sprites: NARC a/0/8/1 (mmodel), one NSBTX per sprite with 32x32 4bpp frames (docs/fase1-sprites.md).
 struct Sprites
 {
-    Narc narc; std::map<int, QImage> cache;
-
-    // Offsets (from the member start) of the frame data and the 16-colour palette; frames = how many 512-byte frames fit.
-    static bool sheet(const uint8_t* d, uint32_t len, int frames, uint32_t& tex, uint32_t& pal)
-    {
-        if (!d || len < 0x60 || memcmp(d, "BTX0", 4)) return false;
-        uint32_t t; memcpy(&t, d + 0x10, 4);                        // first block = TEX0
-        if (t + 0x40 > len || memcmp(d + t, "TEX0", 4)) return false;
-        uint32_t texOff, palOff; memcpy(&texOff, d + t + 0x14, 4); memcpy(&palOff, d + t + 0x38, 4);
-        tex = t + texOff; pal = t + palOff;
-        return tex + frames * 512 <= len && pal + 32 <= len;
-    }
+    HGTGhost::Narc narc; std::map<int, QImage> cache;
 
     QImage get(int mmodel, int frame)
     {
         int key = mmodel * 64 + frame; auto it = cache.find(key); if (it != cache.end()) return it->second;
         QImage img(32, 32, QImage::Format_ARGB32); img.fill(Qt::transparent);
         uint32_t len, tex, pal; const uint8_t* d = narc.file(mmodel, len);
-        if (sheet(d, len, frame + 1, tex, pal))
+        if (HGTGhost::sheet(d, len, frame + 1, tex, pal))
             for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++)
             {
                 int b = d[tex + frame * 512 + (y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
@@ -785,9 +731,6 @@ const SpriteDef kSprites[] = {
     {245,12,"Rkanbum 3"}, {246,24,"Plboy 01C"}, {247,24,"Plgirl 01C"}, {250,12,"Delivery 2"}
 };
 const int kNumSprites = sizeof kSprites / sizeof *kSprites;
-// Hero frame index -> NPC-sheet frame. Hero: up stand 0, walk 20/9, run 7/10 (8 same group); down stand 21, walk 23/22,
-// run 11/12/13; side stand 2, walk 3/1, run 15/14/16 (17-19, 4-6 same group). NPC: up 0/8/7, side 2/3/1, down 9/10/11.
-const uint8_t kNpcMap[24] = {0, 1, 2, 3, 2, 2, 2, 8, 7, 7, 7, 10, 11, 10, 2, 3, 1, 2, 3, 1, 8, 9, 11, 10};
 
 
 // HeartGold party-menu palette
@@ -804,24 +747,23 @@ public:
     HGTPanel(EmuInstance* emu, std::function<QString()> romPath) : emu(emu), romPath(std::move(romPath))
     {
         setMinimumWidth(370);
-        int port = atoi(getenv("HGT_PORT") ? getenv("HGT_PORT") : "0");
+        port = atoi(getenv("HGT_PORT") ? getenv("HGT_PORT") : "0"); instance = atoi(getenv("HGT_INSTANCE") ? getenv("HGT_INSTANCE") : "0");
         if (const char* peer = getenv("HGT_PEER")) { QStringList p = QString(peer).split(':'); if (p.size() == 2) { peerHost = QHostAddress(p[0]); peerPort = p[1].toInt() + 100; } }
         if (port) sock.bind(QHostAddress::AnyIPv4, port + 100);   // +1 would collide with the peer's ghost port when ports are consecutive
         QObject::connect(&sock, &QUdpSocket::readyRead, [this] { receive(); });
         QObject::connect(&timer, &QTimer::timeout, [this] { poll(); });
         timer.start(250);
-        spriteMm = Config::GetGlobalTable().GetInt("HGT.Sprite") - 1;   // stored +1 so "unset" (0) = game default
-        if (const char* e = getenv("HGT_SPRITE")) spriteMm = atoi(e);   // mmodel member, for the launcher / headless tests
+        if (const char* e = getenv("HGT_SPRITE")) spriteMm = atoi(e);   // mmodel member, for the launcher / headless tests; else <rom>.sprite (poll)
         if (const char* e = getenv("HGT_DOCK_PAGE")) page = atoi(e);   // headless test: dump a given page
     }
 
 private:
-    EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0;
+    EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0, port = 0, instance = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
     Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite; Soul Link is always shown
-    Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0;
+    Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
     // --- data ---
     bool readParty(NDS& nds)
@@ -838,7 +780,7 @@ private:
         if (nds.ARM9Read32(hdr) != 2) { saveData = 0; return false; }
         // PLAYERDATA (save array 1): Options (2 bytes, padded to 4) then PlayerProfile: name u16[8], id, money, gender, language, johtoBadges @0x1A, ..., kantoBadges @0x1F
         uint32_t prof = saveData + 0x10 + nds.ARM9Read32(saveData + 0x23014 + 1 * 0x10 + 8) + 4; char nm[8] = {};
-        for (int i = 0; i < 7; i++) { uint16_t c = nds.ARM9Read16(prof + 2 * i); if (c == 0xFFFF) break; nm[i] = dsChar(c); }
+        for (int i = 0; i < 7; i++) { uint16_t c = nds.ARM9Read16(prof + 2 * i); if (c == 0xFFFF) break; nm[i] = HGTGhost::dsChar(c); }
         if (nm[0]) myName = nm;
         gender = nds.ARM9Read8(prof + 0x18); johto = nds.ARM9Read8(prof + 0x1A); kanto = nds.ARM9Read8(prof + 0x1F); gameClear = nds.ARM9Read8(prof + 0x1D) & 1;
         uint32_t party = saveData + 0x10 + nds.ARM9Read32(hdr + 8), cur = nds.ARM9Read32(party + 4); if (cur > 6) return false;
@@ -876,6 +818,14 @@ private:
         QFile f(jsonPath); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(a).toJson());
     }
 
+    // Sprite choice lives next to the ROM, not in melonDS.toml: two windows on one pc share that file and the last one
+    // closed overwrites it (Window.cpp saves the whole config on close), so the choice never survived a restart.
+    void loadSprite(const QString& rom)
+    {
+        QFile f(rom + ".sprite"); if (!getenv("HGT_SPRITE") && f.open(QIODevice::ReadOnly)) spriteMm = f.readAll().trimmed().toInt();
+    }
+    void saveSprite() { QFile f(romPath() + ".sprite"); if (f.open(QIODevice::WriteOnly)) f.write(QByteArray::number(spriteMm)); }
+
     void loadJson()
     {
         QFile f(jsonPath); if (!f.open(QIODevice::ReadOnly)) return;
@@ -910,11 +860,19 @@ private:
     void poll()
     {
         NDS* nds = emu->getNDS(); if (!nds) return;
-        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); } }
+        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); } }
         if (readParty(*nds)) updateLog();
         applySprite(*nds);
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
+        // camera test (emulator/test-cam.sh): the game area as the X server shows it, so it also works with the OpenGL renderer
+        if (const char* d = getenv("HGT_SCREEN_DUMP")) if (++shotTicks % 8 == 0)
+            if (auto* mw = qobject_cast<QMainWindow*>(window()); mw && mw->centralWidget())
+            {
+                if (shotTicks == 8) mw->resize(1024 + 400, 768 + 40);   // top screen at 4x next to the dock
+                QWidget* c = mw->centralWidget(); QPoint o = c->mapTo(mw, QPoint(0, 0));
+                QGuiApplication::primaryScreen()->grabWindow(mw->winId(), o.x(), o.y(), c->width(), c->height()).save(QString("%1/shot-%2.png").arg(d).arg(shotTicks / 8, 3, 10, QChar('0')));
+            }
     }
 
     // --- trainer sprite ---
@@ -926,14 +884,15 @@ private:
         uint8_t* rom = const_cast<uint8_t*>(cart->GetROM()); uint32_t romLen = cart->GetROMLength();
         const SpriteDef* d = spriteDef(spriteMm);
         uint32_t slen = 0, texS = 0, palS = 0; const uint8_t* src = d ? sprites.narc.file(d->mmodel, slen) : nullptr;
-        if (d && !Sprites::sheet(src, slen, d->frames, texS, palS)) d = nullptr;
+        if (d && !HGTGhost::sheet(src, slen, d->frames, texS, palS)) d = nullptr;
+        HGTGhost::mySprite = d ? d->mmodel : -1; HGTGhost::myFrames = d ? d->frames : 24;   // gaat mee in het positiepakket
         for (int member : {69, 70})
         {
             uint32_t hlen, texH, palH; const uint8_t* orig = sprites.narc.file(member, hlen);
-            if (!Sprites::sheet(orig, hlen, 24, texH, palH)) continue;
+            if (!HGTGhost::sheet(orig, hlen, 24, texH, palH)) continue;
             uint32_t at = sprites.narc.romOffset(member); if ((uint64_t)at + hlen > romLen) continue;
             uint8_t want[24 * 512 + 32];
-            for (int k = 0; k < 24; k++) memcpy(want + k * 512, d ? src + texS + (d->frames == 24 ? k : kNpcMap[k]) * 512 : orig + texH + k * 512, 512);
+            for (int k = 0; k < 24; k++) memcpy(want + k * 512, d ? src + texS + (d->frames == 24 ? k : HGTGhost::kNpcMap[k]) * 512 : orig + texH + k * 512, 512);
             memcpy(want + 24 * 512, d ? src + palS : orig + palH, 32);
             uint8_t* dst = rom + at;
             if (memcmp(dst + texH, want, 24 * 512) || memcmp(dst + palH, want + 24 * 512, 32))
@@ -954,7 +913,7 @@ private:
             if (spriteCells[i].contains(e->pos()))
             {
                 spriteMm = i == 0 ? -1 : kSprites[i - 1].mmodel;
-                Config::GetGlobalTable().SetInt("HGT.Sprite", spriteMm + 1); Config::Save();
+                saveSprite();
                 update(); return;
             }
     }
@@ -1147,14 +1106,23 @@ private:
     {
         QPainter g(this); g.fillRect(rect(), cBg); QFont f = g.font(); f.setPointSize(10); g.setFont(f);
         int W = width(), y = 0; auto ps = pairs();
-        qint64 since = peerSeen ? (QDateTime::currentMSecsSinceEpoch() - peerSeen) / 1000 : -1; bool online = since >= 0 && since < 3;
-        QString status = online ? QString(QChar(0x25cf)) + " connected" : since < 0 ? QString(QChar(0x25cb)) + " waiting for friend" : QString(QChar(0x25cb)) + QString(" no signal %1s").arg(since);
         header(g, y, "HG TOGETHER");
-        g.setPen(online ? cGreen : cYellow); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, status);
+        g.setPen(cSlot); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, QString("port %1 %2 instance %3").arg(port).arg(QChar(0x00b7)).arg(instance));
         Boss cap = levelCap(johto, kanto, gameClear); int badges = __builtin_popcount(johto) + __builtin_popcount(kanto);
         g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 20); g.setPen(cText);
         g.drawText(QRect(16, y, W - 32, 20), Qt::AlignVCenter, QString("%1 %2 %3  %4  Cap %5 (%6)  %4  %7/16 badges").arg(myName, QChar(0x2194), peerName, QChar(0x00b7)).arg(cap.cap).arg(cap.name).arg(badges));
         y += 26;
+        // connection status per peer from the ghost bridge (HGTogether.cpp): name, sprite, seconds since the last position packet
+        auto peers = HGTogether::peerStatus();
+        if (peers.empty()) { g.setPen(cYellow); g.drawText(QRect(16, y, W - 32, 18), Qt::AlignVCenter, QString(QChar(0x25cb)) + " waiting for friend"); y += 20; }
+        for (auto& p : peers)
+        {
+            const SpriteDef* d = spriteDef(p.sprite); QString spr = p.sprite < 0 ? (p.gender ? "Heroine" : "Hero") : d ? d->name : QString::number(p.sprite);
+            g.setPen(p.connected ? cGreen : cYellow);
+            g.drawText(QRect(16, y, W - 32, 18), Qt::AlignVCenter, QString("%1 %2 (%3)  %4").arg(QChar(p.connected ? 0x25cf : 0x25cb)).arg(QString::fromStdString(p.name), spr)
+                       .arg(p.connected ? QString("%1s ago").arg(p.since, 0, 'f', 1) : QString("no signal %1s").arg((int)p.since)));
+            y += 20;
+        }
         pageSoulLink(g, y, ps);
         y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
         if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y);

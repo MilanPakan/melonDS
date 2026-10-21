@@ -4,6 +4,8 @@
 // HGT_DUMP_DIR=map voor een PPM van het bovenscherm elke 60 frames (optioneel, voor headless tests).
 // shortcut: één peer, geen handshake, plain UDP; upgraden naar ENet/relay zodra de launcher (fase 3) er is.
 #include "HGTogether.h"
+#include "HGTGhost.h"
+#include "HGTCamera.h"
 #include "EmuInstance.h"
 #include "NDS.h"
 #include "GPU.h"
@@ -19,6 +21,9 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <fcntl.h>
+#include <io.h>   // open/read voor de HGT_CTL-pijp; op Windows alleen compileerbaar, een FIFO bestaat daar niet
+#define O_NONBLOCK 0
 typedef int socklen_t;
 #else
 #include <arpa/inet.h>
@@ -33,16 +38,18 @@ using namespace melonDS;
 
 namespace
 {
-struct State { int32_t mapId, x, z, facing, px, pz; uint32_t frame; };   // px/pz: positionVector (fx32)
+struct State { int32_t mapId, x, z, facing, px, pz; uint32_t frame; HGTGhost::Info info; };   // px/pz: positionVector (fx32)
 
 const uint32_t kFieldSysLiteral = 0x0203E304;   // literal = &sFieldSysPtr (Sacred Gold / US HG)
-const int kPlayerSX = 128, kPlayerSY = 97;       // schermpositie van de eigen speler: midden, voeten op y=97 (gemeten)
 const uint32_t kPeerTimeout = 180;               // frames zonder pakket -> ghost verbergen
 
 bool enabled = false, initDone = false;
 int sock = -1;
 sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
-State me{}, peer{}; bool havePeer = false;
+State me{};
+struct Peer { sockaddr_storage addr; socklen_t len; State st; uint32_t seen; };
+std::vector<Peer> peers;                                   // iedereen van wie we een positiepakket kregen
+std::vector<std::pair<sockaddr_storage, socklen_t>> sendTo;   // alle HGT_PEER-adressen (komma-gescheiden); peerAddr = de eerste (battle-sein)
 // Co-op trainerbattle (bench/hgtpatch.py): de ROM-hook zet HGT.signal = trainerId op kSignal; wij sturen dat als
 // BattleMsg naar de ander, die daarop het joiner-script (HGT_JOIN_SCRIPT, standaard 9019) injecteert via de mailbox.
 struct BattleMsg { char tag[4]; uint32_t trainer; };
@@ -57,7 +64,7 @@ bool hookOn(NDS& nds) { uint32_t tb = nds.ARM9Read32(kCmd213); return tb > kCave
 // Club-UI automatisch: na het sein (leader) of de injectie (joiner) elke 40 frames A, tot de club verbonden is,
 // maximaal kClubFrames.
 const uint32_t kClubFrames = 1500; int clubRole = 0; uint32_t clubUntil = 0; u32 autoKeyFrames = 0;
-uint32_t frame = 0, peerSeen = 0;
+uint32_t frame = 0;
 std::string dumpDir;
 
 bool inRam(uint32_t a) { return a >= 0x02000000 && a < 0x02400000; }
@@ -72,6 +79,7 @@ bool readState(NDS& nds, State& s)
     s.mapId = nds.ARM9Read32(loc);
     s.x = nds.ARM9Read32(mo + 0x64); s.z = nds.ARM9Read32(mo + 0x6C); s.facing = nds.ARM9Read32(mo + 0x28);
     s.px = nds.ARM9Read32(mo + 0x70); s.pz = nds.ARM9Read32(mo + 0x78);
+    HGTGhost::readInfo(nds, s.info);
     return true;
 }
 
@@ -91,14 +99,16 @@ void init()
 #else
     fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
 #endif
-    if (peerStr)
+    for (std::string all = peerStr ? peerStr : ""; !all.empty();)
     {
-        std::string s = peerStr; auto colon = s.rfind(':');
-        if (colon == std::string::npos) { fprintf(stderr, "HGT: HGT_PEER moet host:poort zijn\n"); return; }
+        size_t comma = all.find(','); std::string s = all.substr(0, comma); all = comma == std::string::npos ? "" : all.substr(comma + 1);
+        auto colon = s.rfind(':');
+        if (colon == std::string::npos) { fprintf(stderr, "HGT: HGT_PEER moet host:poort[,host:poort] zijn\n"); return; }
         addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM; addrinfo* res = nullptr;
         if (getaddrinfo(s.substr(0, colon).c_str(), s.substr(colon + 1).c_str(), &hints, &res) != 0 || !res)
-        { fprintf(stderr, "HGT: peer %s niet gevonden\n", peerStr); return; }
-        memcpy(&peerAddr, res->ai_addr, res->ai_addrlen); peerLen = (socklen_t)res->ai_addrlen; freeaddrinfo(res);
+        { fprintf(stderr, "HGT: peer %s niet gevonden\n", s.c_str()); return; }
+        sockaddr_storage a{}; memcpy(&a, res->ai_addr, res->ai_addrlen); sendTo.push_back({a, (socklen_t)res->ai_addrlen}); freeaddrinfo(res);
+        if (!peerLen) { peerAddr = a; peerLen = sendTo.back().second; }
     }
     if (const char* d = getenv("HGT_DUMP_DIR")) dumpDir = d;
     enabled = true;
@@ -107,32 +117,31 @@ void init()
 
 void exchange()
 {
-    if (peerLen) sendto(sock, (const char*)&me, sizeof(me), 0, (sockaddr*)&peerAddr, peerLen);
+    for (auto& a : sendTo) sendto(sock, (const char*)&me, sizeof(me), 0, (sockaddr*)&a.first, a.second);
     char buf[64]; sockaddr_storage from{}; socklen_t fromLen = sizeof(from); int n;
     while ((n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen)) > 0)
     {
-        if (n == (int)sizeof(State)) { memcpy(&peer, buf, sizeof(State)); havePeer = true; peerSeen = frame; }
+        if (n == (int)sizeof(State))
+        {
+            Peer* p = nullptr; for (auto& q : peers) if (q.len == fromLen && !memcmp(&q.addr, &from, fromLen)) p = &q;
+            if (!p) { peers.push_back({from, fromLen, {}, 0}); p = &peers.back(); }
+            memcpy(&p->st, buf, sizeof(State)); p->seen = frame;
+        }
         else if (n == (int)sizeof(BattleMsg) && memcmp(buf, "HGTB", 4) == 0) { memcpy(&peerBattle, buf, sizeof(BattleMsg)); peerBattleSeen = frame; }
-        if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; }   // peer onbekend: antwoord naar afzender
+        if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; sendTo.push_back({from, fromLen}); }   // peer onbekend: antwoord naar afzender
         fromLen = sizeof(from);
     }
 }
 
-void drawGhost(u32* fb)
+void drawGhosts(void* top, bool cpu, NDS& nds)
 {
-    // 1 tile = 16 wereld-eenheden (fx32) = 16 px; verticaal benaderd met dezelfde schaal (perspectief later).
-    // shortcut: ghost = doorschijnende kopie van de eigen spelersprite (16x24 px rond het midden), dus zelfde
-    // geslacht/outfit als jijzelf; echte sprite uit de ROM zodra we OAM-injectie doen.
-    int dx = (peer.px - me.px) >> 12, dy = (peer.pz - me.pz) >> 12;
-    if (dx == 0 && dy == 0) return;
-    for (int y = 0; y < 24; y++)
-        for (int x = 0; x < 16; x++)
-        {
-            int sx = kPlayerSX - 8 + x, sy = kPlayerSY - 23 + y, tx = sx + dx, ty = sy + dy;
-            if (sx < 0 || sx >= 256 || sy < 0 || sy >= 192 || tx < 0 || tx >= 256 || ty < 0 || ty >= 192) continue;
-            u32 src = fb[sy * 256 + sx], dst = fb[ty * 256 + tx];
-            fb[ty * 256 + tx] = (((src >> 1) & 0x7F7F7F7F) + ((dst >> 1) & 0x7F7F7F7F)) | 0xFF000000 | 0x00200020;   // 50/50 + paarse zweem
-        }
+    int32_t mine[3] = { me.px, me.info.py, me.pz };
+    for (size_t i = 0; i < peers.size(); i++)
+    {
+        const State& p = peers[i].st; if (p.mapId != me.mapId || frame - peers[i].seen >= kPeerTimeout) continue;
+        int32_t pos[3] = { p.px, p.info.py, p.pz };
+        HGTGhost::draw(top, cpu, nds, (int)i, mine, pos, p.facing, frame, p.info);   // sprite + naam van de ander (HGTGhost.cpp)
+    }
 }
 
 void dump(const u32* fb)
@@ -235,6 +244,15 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
     return true;
 }
 
+std::vector<HGTogether::PeerStatus> HGTogether::peerStatus()
+{
+    // shortcut: geen lock; peers groeit alleen bij een nieuwe peer en het dock leest hooguit 4x per seconde; lock zodra het gaat kraken
+    std::vector<PeerStatus> v;
+    for (const Peer& p : peers)
+        v.push_back({ std::string(p.st.info.name, strnlen(p.st.info.name, 8)), p.st.info.gender, p.st.info.sprite, p.st.info.frames, (frame - p.seen) / 60.0f, frame - p.seen < kPeerTimeout });
+    return v;
+}
+
 bool HGTogether::input(EmuInstance* emu)
 {
     if (!emu->nds) return false;
@@ -329,7 +347,7 @@ void HGTogether::tick(EmuInstance* emu)
     if (!initDone) init();
     if (!enabled || !emu->nds) return;
     frame++;
-    if (frame == 1) startLan(emu);
+    if (frame == 1) { startLan(emu); HGTGhost::init(emu->baseROMDir + "/" + emu->baseROMName); }
     if (frame == 2) if (const char* st = getenv("HGT_LOADSTATE")) if (*st) fprintf(stderr, "HGT: savestate %s %s\n", st, emu->loadState(st) ? "geladen" : "MISLUKT");
     NDS& nds = *emu->nds;
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
@@ -349,7 +367,7 @@ void HGTogether::tick(EmuInstance* emu)
         if (inRam(fs))
         {
             const char* js = getenv("HGT_JOIN_SCRIPT");
-            nds.ARM9Write32(kSignal - 4, peerBattle.trainer); nds.ARM9Write32(kSignal + 12, peerBattle.trainer);   // HGT.trainer/trainer2: zelfde vijand op beide kanten
+            nds.ARM9Write32(kSignal - 4, peerBattle.trainer);   // HGT.trainer: zelfde vijand op beide kanten (START leest alleen dit)
             call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = js ? atoi(js) : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true; lastJoin = frame;
             fprintf(stderr, "HGT: ander start trainerbattle %u -> joiner-script %u\n", peerBattle.trainer, call.a[1]);
             clubRole = 2; clubUntil = frame + kClubFrames;
@@ -361,16 +379,19 @@ void HGTogether::tick(EmuInstance* emu)
         if (joined || frame >= clubUntil) { fprintf(stderr, "HGT: club %s %s\n", clubRole == 1 ? "leader" : "joiner", joined ? "verbonden" : "TIME-OUT"); clubRole = 0; }
         else if (frame % 40 == 0) autoKeyFrames = 4;   // A (JOIN THIS GROUP / YES); op "Awaiting contact" doet A niets
     }
+    HGTCamera::apply(nds);   // camera-experiment (HGT_CAM), vóór de ghost zodat die dezelfde camera leest
     bool haveMe = readState(nds, me); me.frame = frame;
     if (haveMe) exchange();
     void* top = nullptr; void* bottom = nullptr;
-    if (!nds.GPU.GetFramebuffers(&top, &bottom) || !top) return;
+    bool cpu = nds.GPU.GetFramebuffers(&top, &bottom); if (!top) return;   // false = OpenGL: top = &GLuint van de uitvoertextuur
+    if (haveMe) drawGhosts(top, cpu, nds);
+    if (!cpu) return;
     u32* fb = (u32*)top;
-    if (haveMe && havePeer && peer.mapId == me.mapId && frame - peerSeen < kPeerTimeout) drawGhost(fb);
     if (!dumpDir.empty() && frame % 60 == 0)
     {
         dump(fb);
-        fprintf(stderr, "HGT f%u ik(map %d %d,%d r%d) peer(%s map %d %d,%d r%d)\n", frame, me.mapId, me.x, me.z, me.facing,
-                havePeer ? "ok" : "-", peer.mapId, peer.x, peer.z, peer.facing);
+        const State* p = peers.empty() ? nullptr : &peers[0].st;
+        fprintf(stderr, "HGT f%u ik(map %d %d,%d r%d) peers %zu eerste(map %d %d,%d r%d)\n", frame, me.mapId, me.x, me.z, me.facing,
+                peers.size(), p ? p->mapId : 0, p ? p->x : 0, p ? p->z : 0, p ? p->facing : 0);
     }
 }

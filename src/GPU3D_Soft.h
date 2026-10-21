@@ -43,6 +43,7 @@ public:
     void RestartFrame() override;
 
     u32* GetLine(int line) override;
+    u32 GetDepth(int x, int y) const { return DepthBuffer[FirstPixelOffset + y * ScanlineWidth + x]; }   // HG-Together: ghost-occlusie
 
     void SetupRenderThread();
     void EnableRenderThread();
