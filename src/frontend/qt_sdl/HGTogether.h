@@ -19,6 +19,10 @@ struct InviteStatus {
     float secondsLeft = 0, timeout = 15;   // aftelbalk
 };
 InviteStatus inviteStatus();
+// Zetten na een level-up buiten de battle (doel A): learned = automatisch in een vrij slot gezet; false = alle 4 slots vol,
+// overgeslagen ("<soort> kan <zet> leren"). Soort/zet als nummers (namen in het dock). Haalt en leegt de lijst.
+struct LearnNotice { uint16_t species, move; bool learned; };
+std::vector<LearnNotice> takeLearnNotices();
 void inviteAnswer(bool accept);   // alleen zinvol bij phase 0
 // Elk frame na NDS::RunFrame aanroepen vanaf de emu-thread. Doet niets zonder HGT_PORT in de omgeving.
 void tick(EmuInstance* emu);

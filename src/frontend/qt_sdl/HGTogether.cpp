@@ -75,6 +75,8 @@ std::mutex inviteMx; HGTogether::InviteStatus invitePub;   // kopie voor het doc
 // (zonder de tijdelijke vars 0x4000-0x401F) als HGTF naar de ander; die past ze toe zodra hij in de overworld staat.
 const uint32_t kFlagsBlk = 0x170 * 2 + 2912 / 8, kTempVarBytes = 0x20 * 2;
 std::vector<u8> storySnap, storyPending; int storyState = 0; uint32_t storyIdle = 0;
+// LEARNLOG van de EXPJ-cave (bench/hgtpatch.py): u32 aantal, 8x {u16 soort, u16 zet (|0x8000 = slots vol, overgeslagen)}
+const uint32_t kLearnLog = 0x02078D00; std::mutex learnMx; std::vector<HGTogether::LearnNotice> learnNotices;
 // Is de hook er echt (scriptcommando 213 -> onze TB-cave)? Zonder hook (ongepatchte ROM/andere states) staat op kSignal
 // gewone code: die niet als sein lezen en ook geen joiner-script injecteren (9019 bestaat dan niet).
 const uint32_t kCmd213 = 0x020FB054, kCaveLo = 0x02078834, kCaveHi = 0x02078B00;
@@ -491,6 +493,21 @@ void HGTogether::tick(EmuInstance* emu)
             fprintf(stderr, "HGT: co-op-battle verloren -> whiteout (script %u)\n", call.a[1]);
         }
     }
+    if (hook)
+    {
+        uint32_t n = nds.ARM9Read32(kLearnLog);
+        if (n && n <= 8)
+        {
+            std::lock_guard<std::mutex> l(learnMx);
+            for (uint32_t k = 0; k < n; k++)
+            {
+                uint16_t sp = nds.ARM9Read16(kLearnLog + 4 + 4 * k), mv = nds.ARM9Read16(kLearnLog + 6 + 4 * k);
+                learnNotices.push_back({sp, uint16_t(mv & 0x7FFF), !(mv & 0x8000)});
+                fprintf(stderr, "HGT: soort %u %s zet %u\n", sp, (mv & 0x8000) ? "kan (slots vol, overgeslagen)" : "leerde", mv & 0x7FFF);
+            }
+            nds.ARM9Write32(kLearnLog, 0);
+        }
+    }
     if (storyPending.size() >= 2)
     {
         uint32_t fb = flagsBlock(nds); uint16_t cnt = storyPending[0] | storyPending[1] << 8;
@@ -528,5 +545,6 @@ void HGTogether::tick(EmuInstance* emu)
 namespace HGTogether
 {
 InviteStatus inviteStatus() { std::lock_guard<std::mutex> l(inviteMx); return invitePub; }
+std::vector<LearnNotice> takeLearnNotices() { std::lock_guard<std::mutex> l(learnMx); std::vector<LearnNotice> v; v.swap(learnNotices); return v; }
 void inviteAnswer(bool accept) { guiAnswer = accept ? 1 : 0; }
 }
