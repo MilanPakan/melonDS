@@ -69,11 +69,30 @@ const uint32_t kDecision = 0x02078B1C, kInviteFrames = 15 * 60, kHoldFrames = 12
 struct InviteRun { int role = 0, phase = 0; uint32_t trainer = 0, until = 0, holdUntil = 0; bool mine = false, theirs = false; } inv;
 std::atomic<int> guiAnswer{-1};   // inviteAnswer() vanaf de GUI-thread: 1 ja, 0 nee
 std::mutex inviteMx; HGTogether::InviteStatus invitePub;   // kopie voor het dock (inviteStatus)
+// Story-sync (doel A punt 3, playtest 3): na een co-op-battle de door het leader-script gewijzigde vars/flags (trainervlag,
+// scène-vars van bv. Silver) ook bij de ander zetten. Save-array 4 (SAVE_FLAGS): u16 vars[0x170] (var 0x4000+i), dan
+// flags[2912/8]. Leader: kopie bij "samen", na de battle wachten tot 60 frames geen taak loopt, dan de gewijzigde bytes
+// (zonder de tijdelijke vars 0x4000-0x401F) als HGTF naar de ander; die past ze toe zodra hij in de overworld staat.
+const uint32_t kFlagsBlk = 0x170 * 2 + 2912 / 8, kTempVarBytes = 0x20 * 2;
+std::vector<u8> storySnap, storyPending; int storyState = 0; uint32_t storyIdle = 0;
 // Is de hook er echt (scriptcommando 213 -> onze TB-cave)? Zonder hook (ongepatchte ROM/andere states) staat op kSignal
 // gewone code: die niet als sein lezen en ook geen joiner-script injecteren (9019 bestaat dan niet).
 const uint32_t kCmd213 = 0x020FB054, kCaveLo = 0x02078834, kCaveHi = 0x02078B00;
 // club-struct van overlay 3 (pointer op 0x022598A0, alleen gezet zolang de club-UI draait); +0x88 = retCode, 2 = verbonden
 bool clubConnected(NDS& nds) { uint32_t c = nds.ARM9Read32(0x022598A0); return c >= 0x02000000 && c < 0x02400000 && nds.ARM9Read32(c + 0x88) == 2; }
+uint32_t flagsBlock(NDS& nds)   // adres van SAVE_FLAGS (vars + flags) of 0
+{
+    uint32_t var = nds.ARM9Read32(0x0203E304), fs = var >= 0x02000000 && var < 0x02400000 ? nds.ARM9Read32(var) : 0;
+    if (fs < 0x02000000 || fs >= 0x02400000) return 0;
+    uint32_t sd = nds.ARM9Read32(fs + 0xC); if (sd < 0x02000000 || sd >= 0x02400000) return 0;
+    if (nds.ARM9Read32(sd + 0x23014 + 4 * 0x10) != 4) return 0;   // blok-header-id moet 4 zijn
+    return sd + 0x10 + nds.ARM9Read32(sd + 0x23014 + 4 * 0x10 + 8);
+}
+void storyStartAt(NDS& nds, int state)   // kopie van vars/flags; 1 = co-op (wacht op HGT.done), 3 = solo (wacht op begin en einde van de battle)
+{
+    uint32_t fb = flagsBlock(nds); storySnap.clear(); storyState = 0;
+    if (fb) { for (uint32_t i = 0; i < kFlagsBlk; i++) storySnap.push_back(nds.ARM9Read8(fb + i)); storyState = state; }
+}
 bool hookOn(NDS& nds) { uint32_t tb = nds.ARM9Read32(kCmd213); return tb > kCaveLo && tb < kCaveHi; }
 // Club-UI automatisch: na het sein (leader) of de injectie (joiner) elke 40 frames A, tot de club verbonden is,
 // maximaal kClubFrames.
@@ -132,7 +151,7 @@ void init()
 void exchange(bool send = true)
 {
     if (send) for (auto& a : sendTo) sendto(sock, (const char*)&me, sizeof(me), 0, (sockaddr*)&a.first, a.second);
-    char buf[64]; sockaddr_storage from{}; socklen_t fromLen = sizeof(from); int n;
+    char buf[1500]; sockaddr_storage from{}; socklen_t fromLen = sizeof(from); int n;
     while ((n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen)) > 0)
     {
         if (n == (int)sizeof(State))
@@ -142,6 +161,7 @@ void exchange(bool send = true)
             memcpy(&p->st, buf, sizeof(State)); p->seen = frame;
         }
         else if (n == (int)sizeof(BattleMsg) && memcmp(buf, "HGT", 3) == 0) { BattleMsg m; memcpy(&m, buf, sizeof(m)); netMsgs.push_back(m); }
+        else if (n >= 6 && memcmp(buf, "HGTF", 4) == 0) storyPending.assign(buf + 4, buf + n);   // story-sync: u16 aantal, dan (u16 offset, u8 waarde)
         if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; sendTo.push_back({from, fromLen}); }   // peer onbekend: antwoord naar afzender
         fromLen = sizeof(from);
     }
@@ -381,14 +401,18 @@ void HGTogether::tick(EmuInstance* emu)
     auto send = [&](const char* tag, uint32_t tr) { BattleMsg m; memcpy(m.tag, tag, 4); m.trainer = tr;
         for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen); };
     auto finish = [&](int phase) { inv.phase = phase; inv.holdUntil = frame + kHoldFrames; };
+    auto storyStart = [&](int st) { storyStartAt(nds, st); };
     auto decide = [&](bool together) {   // leader: beslissing naar de ROM (WAIT start de club of de solo-battle) en naar de ander
         nds.ARM9Write32(kDecision, together ? 1 : 2); send(together ? "HGTG" : "HGTS", inv.trainer);
         fprintf(stderr, "HGT: uitnodiging trainer %u -> %s\n", inv.trainer, together ? "SAMEN (2v2)" : "solo");
         if (together) { clubRole = 1; clubUntil = frame + kClubFrames; }
+        storyStart(together ? 1 : 3);
         finish(together ? 2 : 3); };
     bool online = !peers.empty() && frame - peers[0].seen < kPeerTimeout;
     const char* aa = getenv("HGT_AUTO_ACCEPT"); bool autoYes = aa && *aa && *aa != '0';   // tests/headless: altijd ja
     uint32_t t = hook ? nds.ARM9Read32(kSignal) : 0;
+    if (t & 0x80000000u)   // ROM: solo-battle zonder uitnodiging (trainer met 1 Pokémon): alleen story-sync
+    { nds.ARM9Write32(kSignal, 0); fprintf(stderr, "HGT: trainerbattle %u solo (1 Pokémon)\n", t & 0x7FFFFFFF); storyStart(3); t = 0; }
     if (t)   // ROM-hook: trainerbattle, WAIT wacht op de beslissing
     {
         nds.ARM9Write32(kSignal, 0);
@@ -432,6 +456,37 @@ void HGTogether::tick(EmuInstance* emu)
             call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = js ? atoi(js) : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true; lastJoin = frame;
             fprintf(stderr, "HGT: ander start trainerbattle %u -> joiner-script %u\n", peerBattle.trainer, call.a[1]);
             clubRole = 2; clubUntil = frame + kClubFrames;
+        }
+    }
+    if (storyState == 1 && nds.ARM9Read32(kSignal + 4)) { storyState = 2; storyIdle = 0; }   // HGT.done: battle klaar
+    if (storyState >= 3)   // solo: 3 = wacht tot de battle-app draait, 4 = wacht tot hij weg is
+    {
+        uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0;
+        uint32_t pm = inRam(fs) ? nds.ARM9Read32(fs) : 0; bool app = inRam(pm) && inRam(nds.ARM9Read32(pm + 4));
+        if (storyState == 3 && app) storyState = 4; else if (storyState == 4 && !app) { storyState = 2; storyIdle = 0; }
+    }
+    if (storyState == 2)
+    {
+        uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0, fb = flagsBlock(nds);
+        storyIdle = inRam(fs) && !nds.ARM9Read32(fs + 0x10) && fb ? storyIdle + 1 : 0;   // geen taak/script meer
+        if (storyIdle >= 60)
+        {
+            std::vector<u8> msg = {'H', 'G', 'T', 'F', 0, 0}; uint16_t cnt = 0;
+            for (uint32_t i = kTempVarBytes; i < kFlagsBlk && msg.size() < 1400; i++)
+            { u8 v = nds.ARM9Read8(fb + i); if (v != storySnap[i]) { msg.push_back(i & 0xFF); msg.push_back(i >> 8); msg.push_back(v); cnt++; } }
+            msg[4] = cnt & 0xFF; msg[5] = cnt >> 8;
+            for (int k = 0; k < 3 && peerLen; k++) sendto(sock, (const char*)msg.data(), msg.size(), 0, (sockaddr*)&peerAddr, peerLen);
+            fprintf(stderr, "HGT: story-sync %u gewijzigde bytes naar de ander\n", cnt); storyState = 0;
+        }
+    }
+    if (storyPending.size() >= 2)
+    {
+        uint32_t fb = flagsBlock(nds); uint16_t cnt = storyPending[0] | storyPending[1] << 8;
+        if (fb && storyPending.size() >= 2u + 3u * cnt)
+        {
+            for (uint16_t k = 0; k < cnt; k++) { const u8* e = &storyPending[2 + 3 * k]; uint32_t off = e[0] | e[1] << 8;
+                if (off >= kTempVarBytes && off < kFlagsBlk) nds.ARM9Write8(fb + off, e[2]); }
+            fprintf(stderr, "HGT: story-sync %u bytes van de ander toegepast\n", cnt); storyPending.clear();
         }
     }
     if (clubRole)
