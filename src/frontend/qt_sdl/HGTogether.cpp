@@ -26,6 +26,10 @@
 #include <fcntl.h>
 #include <io.h>   // open/read voor de HGT_CTL-pijp; op Windows alleen compileerbaar, een FIFO bestaat daar niet
 #define O_NONBLOCK 0
+// HGT_CTL is op Windows een gewoon bestand dat groeit: na een lege read aan het einde gaf read() (wine, gemeten 2026-10-21)
+// bijgeschreven regels pas weer na een seek. lseek naar de huidige positie vóór elke read; read() staat alleen in ctlPoll.
+static inline int hgtRead(int fd, void* b, unsigned n) { _lseek(fd, 0, SEEK_CUR); return _read(fd, b, n); }
+#define read hgtRead
 typedef int socklen_t;
 #else
 #include <arpa/inet.h>
