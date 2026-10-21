@@ -19,6 +19,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -56,6 +57,14 @@ std::vector<std::pair<sockaddr_storage, socklen_t>> sendTo;   // alle HGT_PEER-a
 struct BattleMsg { char tag[4]; uint32_t trainer; };
 const uint32_t kSignal = 0x02078B04;
 BattleMsg peerBattle{}; uint32_t peerBattleSeen = 0, lastJoin = 0;
+// Uitnodiging (doel A punt 3, ontwerp Milan): de leader krijgt "samen vechten?", de ander "meedoen?"; beide ja = 2v2,
+// nee/time-out/vriend offline = solo. Berichten (BattleMsg-tag): HGTB uitnodiging, HGTA/HGTD ja/nee van de joiner,
+// HGTG/HGTS start/solo van de leader. Beslissing naar de ROM in HGT.beslissing (kDecision): 1 samen, 2 solo.
+std::vector<BattleMsg> netMsgs;
+const uint32_t kDecision = 0x02078B1C, kInviteFrames = 15 * 60, kHoldFrames = 120;
+struct InviteRun { int role = 0, phase = 0; uint32_t trainer = 0, until = 0, holdUntil = 0; bool mine = false, theirs = false; } inv;
+std::atomic<int> guiAnswer{-1};   // inviteAnswer() vanaf de GUI-thread: 1 ja, 0 nee
+std::mutex inviteMx; HGTogether::InviteStatus invitePub;   // kopie voor het dock (inviteStatus)
 // Is de hook er echt (scriptcommando 213 -> onze TB-cave)? Zonder hook (ongepatchte ROM/andere states) staat op kSignal
 // gewone code: die niet als sein lezen en ook geen joiner-script injecteren (9019 bestaat dan niet).
 const uint32_t kCmd213 = 0x020FB054, kCaveLo = 0x02078834, kCaveHi = 0x02078B00;
@@ -116,9 +125,9 @@ void init()
     fprintf(stderr, "HGT: actief op poort %s, peer %s\n", port, peerStr ? peerStr : "(geen)");
 }
 
-void exchange()
+void exchange(bool send = true)
 {
-    for (auto& a : sendTo) sendto(sock, (const char*)&me, sizeof(me), 0, (sockaddr*)&a.first, a.second);
+    if (send) for (auto& a : sendTo) sendto(sock, (const char*)&me, sizeof(me), 0, (sockaddr*)&a.first, a.second);
     char buf[64]; sockaddr_storage from{}; socklen_t fromLen = sizeof(from); int n;
     while ((n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen)) > 0)
     {
@@ -128,7 +137,7 @@ void exchange()
             if (!p) { peers.push_back({from, fromLen, {}, 0}); p = &peers.back(); }
             memcpy(&p->st, buf, sizeof(State)); p->seen = frame;
         }
-        else if (n == (int)sizeof(BattleMsg) && memcmp(buf, "HGTB", 4) == 0) { memcpy(&peerBattle, buf, sizeof(BattleMsg)); peerBattleSeen = frame; }
+        else if (n == (int)sizeof(BattleMsg) && memcmp(buf, "HGT", 3) == 0) { BattleMsg m; memcpy(&m, buf, sizeof(m)); netMsgs.push_back(m); }
         if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; sendTo.push_back({from, fromLen}); }   // peer onbekend: antwoord naar afzender
         fromLen = sizeof(from);
     }
@@ -244,6 +253,7 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
                 for (u32 i = 0; i < 64; i++) fprintf(f, "ASP+%02X=%08X\n", 4 * i, rd(nds.ARM9.R_ABT[0] + 4 * i));
                 fclose(f); rename(tmp.c_str(), path); }
         }
+        else if (c == 'i' && sscanf(a, "%u", &x) == 1) guiAnswer = x ? 1 : 0;   // uitnodiging beantwoorden (tests)
         else if (c == 'p' && sscanf(a, "%x %511s", &x, path) == 2) { std::vector<u8> v = hexBytes(path); for (size_t i = 0; i < v.size(); i++) nds.ARM9Write8(x + i, v[i]); }
         else if (c == 'c' && sscanf(a, "%x %x %x %x %x %511s", &x, &call.a[0], &call.a[1], &call.a[2], &call.a[3], path) == 6) { call.addr = x; call.out = path; call.pending = true; break; }
         else if (!l.empty()) fprintf(stderr, "HGT: ctl '%s' ongeldig\n", l.c_str());
@@ -364,13 +374,49 @@ void HGTogether::tick(EmuInstance* emu)
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
     if (frame % 30 == 0) logBattle(nds);
     bool hook = frame > 300 && hookOn(nds);   // pas na de pokes (frame 240+) en alleen als de TB-hook echt in RAM staat
+    auto send = [&](const char* tag, uint32_t tr) { BattleMsg m; memcpy(m.tag, tag, 4); m.trainer = tr;
+        for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen); };
+    auto finish = [&](int phase) { inv.phase = phase; inv.holdUntil = frame + kHoldFrames; };
+    auto decide = [&](bool together) {   // leader: beslissing naar de ROM (WAIT start de club of de solo-battle) en naar de ander
+        nds.ARM9Write32(kDecision, together ? 1 : 2); send(together ? "HGTG" : "HGTS", inv.trainer);
+        fprintf(stderr, "HGT: uitnodiging trainer %u -> %s\n", inv.trainer, together ? "SAMEN (2v2)" : "solo");
+        if (together) { clubRole = 1; clubUntil = frame + kClubFrames; }
+        finish(together ? 2 : 3); };
+    bool online = !peers.empty() && frame - peers[0].seen < kPeerTimeout;
+    const char* aa = getenv("HGT_AUTO_ACCEPT"); bool autoYes = aa && *aa && *aa != '0';   // tests/headless: altijd ja
     uint32_t t = hook ? nds.ARM9Read32(kSignal) : 0;
-    if (t)   // ROM-hook: trainerbattle gestart, ander moet joinen
+    if (t)   // ROM-hook: trainerbattle, WAIT wacht op de beslissing
     {
-        BattleMsg m{ {'H','G','T','B'}, t }; nds.ARM9Write32(kSignal, 0);
-        for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen);
-        fprintf(stderr, "HGT: trainerbattle %u -> sein naar de ander\n", t);
-        clubRole = 1; clubUntil = frame + kClubFrames;
+        nds.ARM9Write32(kSignal, 0);
+        inv = InviteRun{}; inv.role = 1; inv.trainer = t; inv.until = frame + kInviteFrames;
+        if (!online) { fprintf(stderr, "HGT: trainerbattle %u, vriend offline\n", t); decide(false); }
+        else { send("HGTB", t); fprintf(stderr, "HGT: trainerbattle %u -> uitnodiging naar de ander\n", t); if (autoYes) { inv.mine = true; inv.phase = 1; } }
+    }
+    for (const BattleMsg& m : netMsgs)
+    {
+        if (!memcmp(m.tag, "HGTB", 4)) { if (hook && inv.role == 0) { inv = InviteRun{}; inv.role = 2; inv.trainer = m.trainer; inv.until = frame + kInviteFrames;
+            fprintf(stderr, "HGT: uitnodiging van de ander, trainer %u\n", m.trainer); if (autoYes) { inv.mine = true; inv.phase = 1; send("HGTA", m.trainer); } } }
+        else if (inv.role == 1 && inv.phase <= 1 && !memcmp(m.tag, "HGTA", 4)) inv.theirs = true;
+        else if (inv.role == 1 && inv.phase <= 1 && !memcmp(m.tag, "HGTD", 4)) decide(false);
+        else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTS", 4)) finish(3);
+        else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTG", 4)) { peerBattle = m; peerBattleSeen = frame; finish(2); }   // join hieronder
+    }
+    netMsgs.clear();
+    int ans = guiAnswer.exchange(-1);
+    if (ans >= 0 && inv.role && inv.phase == 0)
+    {
+        if (inv.role == 1) { if (ans) { inv.mine = true; inv.phase = 1; } else decide(false); }
+        else { send(ans ? "HGTA" : "HGTD", inv.trainer); if (ans) { inv.mine = true; inv.phase = 1; } else finish(3); }
+    }
+    if (inv.role == 1 && inv.phase <= 1 && inv.mine && inv.theirs) decide(true);
+    if (inv.role && inv.phase <= 1 && frame >= inv.until)   // geen antwoord binnen 15 s: solo
+    { if (inv.role == 1) decide(false); else { if (!inv.mine) send("HGTD", inv.trainer); finish(3); } }
+    if (inv.role && inv.phase >= 2 && frame >= inv.holdUntil) inv = InviteRun{};
+    {
+        std::lock_guard<std::mutex> l(inviteMx);
+        invitePub.role = inv.role; invitePub.phase = inv.phase; invitePub.trainer = inv.trainer; invitePub.timeout = kInviteFrames / 60.0f;
+        invitePub.secondsLeft = inv.role && inv.phase <= 1 && inv.until > frame ? (inv.until - frame) / 60.0f : 0;
+        invitePub.peerName = peers.empty() ? std::string() : std::string(peers[0].st.info.name, strnlen(peers[0].st.info.name, 8));
     }
     if (hook && peerBattleSeen && frame - peerBattleSeen < 2 && frame - lastJoin > 600 && !call.active && !call.pending)
     {
@@ -392,7 +438,7 @@ void HGTogether::tick(EmuInstance* emu)
     }
     HGTCamera::apply(nds);   // camera-experiment (HGT_CAM), vóór de ghost zodat die dezelfde camera leest
     bool haveMe = readState(nds, me); me.frame = frame;
-    if (haveMe) exchange();
+    exchange(haveMe);   // ook zonder eigen positie ontvangen (uitnodiging tijdens een menu)
     void* top = nullptr; void* bottom = nullptr;
     bool cpu = nds.GPU.GetFramebuffers(&top, &bottom); if (!top) return;   // false = OpenGL: top = &GLuint van de uitvoertextuur
     if (haveMe) drawGhosts(top, cpu, nds);
@@ -407,10 +453,9 @@ void HGTogether::tick(EmuInstance* emu)
     }
 }
 
-// Uitnodiging: stub (role 0) tot de echte afhandeling er is, zodat het dock al kan compileren en mergen.
+// Uitnodiging: status voor het dock en antwoord van de speler (afhandeling in tick).
 namespace HGTogether
 {
-static std::mutex inviteMx; static InviteStatus invite;
-InviteStatus inviteStatus() { std::lock_guard<std::mutex> l(inviteMx); return invite; }
-void inviteAnswer(bool accept) { std::lock_guard<std::mutex> l(inviteMx); (void)accept; }
+InviteStatus inviteStatus() { std::lock_guard<std::mutex> l(inviteMx); return invitePub; }
+void inviteAnswer(bool accept) { guiAnswer = accept ? 1 : 0; }
 }
