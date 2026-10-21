@@ -851,6 +851,9 @@ private:
     struct GMap { QString name; std::vector<GTrainer> trainers; std::vector<std::pair<QString, std::vector<GWild>>> wild; };
     struct GBoss { int badge = -1, mapsec = -1, trainer = 0, cap = 0; QString name; };
     std::map<int, GMap> guide; std::vector<GBoss> bosses; bool guideTried = false; QString guidePath;
+    QStringList speciesNames, moveNames;   // guide.json "species"/"moves" (bench/guide.py, msg 237/750), index = Gen 4-nummer
+    // Zetten na een level-up (Metagross' takeLearnNotices): learned blijft 10 s staan, overgeslagen tot de volgende co-op-battle
+    struct Learn { uint16_t species, move; bool learned; qint64 at; }; std::vector<Learn> learns; int lastInviteRole = 0;
     std::set<int> beaten; int guideTrainer = -1; bool wildOpen = false;   // guideTrainer: open team view (-1 = list)
     std::vector<std::pair<QRect, int>> trainerRects; QRect backRect, wildRect;
     // Co-op invite (trainer battle): mirror of HGTogether::InviteStatus (Metagross, battle part). role 0 none / 1 I start (leader) /
@@ -986,6 +989,8 @@ private:
                 }
                 guide[it.key().toInt()] = gm;
             }
+            for (auto v : o["species"].toArray()) speciesNames << v.toString();
+            for (auto v : o["moves"].toArray()) moveNames << v.toString();
             for (auto bv : o["bosses"].toArray()) { QJsonObject b = bv.toObject(); bosses.push_back({b["badge"].toInt(-1), b["mapsec"].toInt(-1), b["trainer"].toInt(), b["cap"].toInt(), b["name"].toString()}); }
             fprintf(stderr, "HGT: guide %s (%zu maps, %zu bosses)\n", c.toUtf8().constData(), guide.size(), bosses.size());
             return;
@@ -1250,6 +1255,14 @@ private:
         if (const char* t = getenv("HGT_DOCK_TOGGLE")) if (nzTicks == atoi(t) * 4) { viewDiorama = !viewDiorama; viewSharp = !viewSharp; saveView(); applyView(); }
         applySprite(*nds);
         invite = readInvite();
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (invite.role && !lastInviteRole) learns.erase(std::remove_if(learns.begin(), learns.end(), [](auto& l) { return !l.learned; }), learns.end());
+        lastInviteRole = invite.role;
+        for (auto& n : HGTogether::takeLearnNotices()) learns.push_back({n.species, n.move, n.learned, now});
+        // test hook: HGT_DOCK_LEARN="soort:zet:geleerd,..." komt na 1 s binnen zoals een takeLearnNotices-batch
+        if (const char* e = getenv("HGT_DOCK_LEARN")) if (nzTicks == 4)
+            for (auto& t : QString(e).split(',')) { auto f = t.split(':'); if (f.size() == 3) learns.push_back({(uint16_t)f[0].toInt(), (uint16_t)f[1].toInt(), f[2] == "1", now}); }
+        learns.erase(std::remove_if(learns.begin(), learns.end(), [now](auto& l) { return l.learned && now - l.at > 10000; }), learns.end());
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
         // camera test (emulator/test-cam.sh): the game area as the X server shows it, so it also works with the OpenGL renderer
@@ -1458,6 +1471,8 @@ private:
             for (auto& c : nzCorrupt) acts.prepend(QString("▶ Corrupt data for %1 (Lv %2, HP %3/%4): put it in the PC and take it out again.").arg(nickOf(c.pid, false)).arg(c.level).arg(c.hp).arg(c.maxhp));
             if (nzSameStarter == 1) acts << QString("▶ You both have the same starter.");
         }
+        auto nameOf = [](const QStringList& l, int i) { return i < l.size() && !l[i].isEmpty() ? l[i] : QString("#%1").arg(i); };
+        for (auto& l : learns) acts << (l.learned ? QString("✓ %1 learned %2.") : QString("▶ %1 could learn %2 (all 4 slots full, skipped).")).arg(nameOf(speciesNames, l.species), nameOf(moveNames, l.move));
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
         for (auto& a : acts) { int h = g.fontMetrics().boundingRect(QRect(0, 0, tw, 1000), Qt::TextWordWrap, a).height() + 4; hs << h; ah += h; }
