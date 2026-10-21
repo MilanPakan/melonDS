@@ -217,6 +217,13 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
         else if (c == 'w' && sscanf(a, "%u", &n) == 1) ctlFrames = n;
         else if (c == 's' && sscanf(a, "%511s", path) == 1) ctlShot(nds, path);
         else if (c == 'r' && sscanf(a, "%x %u %511s", &x, &n, path) == 3) ctlRead(nds, x, n, path);
+        else if (c == 'x' && sscanf(a, "%511s", path) == 1)   // registers + stack (via de CPU, dus ook DTCM): waar hangt de ARM9?
+        {
+            std::string tmp = std::string(path) + ".tmp"; FILE* f = fopen(tmp.c_str(), "w");
+            if (f) { for (int i = 0; i < 16; i++) fprintf(f, "R%d=%08X\n", i, nds.ARM9.R[i]); fprintf(f, "CPSR=%08X\n", nds.ARM9.CPSR);
+                for (u32 i = 0; i < 64; i++) { u32 v = 0; nds.ARM9.DataRead32(nds.ARM9.R[13] + 4 * i, &v); fprintf(f, "SP+%02X=%08X\n", 4 * i, v); }
+                fclose(f); rename(tmp.c_str(), path); }
+        }
         else if (c == 'p' && sscanf(a, "%x %511s", &x, path) == 2) { std::vector<u8> v = hexBytes(path); for (size_t i = 0; i < v.size(); i++) nds.ARM9Write8(x + i, v[i]); }
         else if (c == 'c' && sscanf(a, "%x %x %x %x %x %511s", &x, &call.a[0], &call.a[1], &call.a[2], &call.a[3], path) == 6) { call.addr = x; call.out = path; call.pending = true; break; }
         else if (!l.empty()) fprintf(stderr, "HGT: ctl '%s' ongeldig\n", l.c_str());
@@ -347,6 +354,7 @@ void HGTogether::tick(EmuInstance* emu)
         if (inRam(fs))
         {
             const char* js = getenv("HGT_JOIN_SCRIPT");
+            nds.ARM9Write32(kSignal - 4, peerBattle.trainer); nds.ARM9Write32(kSignal + 12, peerBattle.trainer);   // HGT.trainer/trainer2: zelfde vijand op beide kanten
             call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = js ? atoi(js) : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true; lastJoin = frame;
             fprintf(stderr, "HGT: ander start trainerbattle %u -> joiner-script %u\n", peerBattle.trainer, call.a[1]);
         }
