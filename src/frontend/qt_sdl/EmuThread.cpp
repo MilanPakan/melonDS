@@ -53,6 +53,7 @@
 
 #include "Savestate.h"
 #include "HGTogether.h"
+#include "HGTNuzlocke.h"
 
 #include "EmuInstance.h"
 
@@ -315,6 +316,7 @@ void EmuThread::run()
                 nlines = emuInstance->nds->RunFrame();
             }
             HGTogether::tick(emuInstance);
+            HGTNuzlocke::tick(emuInstance);
 
             if (emuInstance->ndsSave)
                 emuInstance->ndsSave->CheckFlush();

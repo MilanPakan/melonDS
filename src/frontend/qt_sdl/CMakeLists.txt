@@ -13,6 +13,7 @@ set(SOURCES_QT_SDL
     EmuThread.cpp
     HGTogether.cpp
     HGTDock.cpp
+    HGTNuzlocke.cpp
     CheatImportDialog.cpp
     CheatsDialog.cpp
     Config.cpp
