@@ -663,6 +663,28 @@ struct Icons   // party icons: NARC a/0/2/0 (NCLR member 0, NCGR per species)
 };
 
 // Overworld trainer sprites: NARC a/0/8/1 (mmodel), one NSBTX per sprite with 32x32 4bpp frames (docs/fase1-sprites.md).
+// Badges: NARC a/0/4/9 (trainer card). Same resources the card itself loads (overlay 51 table ov51_021E7FC4): NCGR 46 = 16 badges x
+// 12 turn frames of 32x32, 4bpp, 1D-mapped (object = badge*12 + frame, frame 0 = front), NCLR 30 = card metal (row 0 silver, row 1 gold).
+// HGSS draws badges as metal in the card colour; there is no full-colour badge art in this set. Order = badge bits: Zephyr..Rising, Boulder..Earth.
+struct Badges
+{
+    HGTGhost::Narc narc; std::map<int, QImage> cache;
+
+    QImage get(int badge, bool earned)
+    {
+        int key = badge * 2 + earned; auto it = cache.find(key); if (it != cache.end()) return it->second;
+        QImage img(32, 32, QImage::Format_ARGB32); img.fill(Qt::transparent);
+        uint32_t clen, plen; const uint8_t* chr = narc.file(46, clen); const uint8_t* pal = narc.file(30, plen);
+        if (chr && pal && clen >= 0x30 + 192 * 512 && plen >= 0x28 + 64 && !memcmp(chr, "RGCN", 4) && !memcmp(pal, "RLCN", 4))
+            for (int t = 0; t < 16; t++) for (int i = 0; i < 64; i++)
+            {
+                int b = chr[0x30 + (badge * 12 * 16 + t) * 32 + i / 2], c = (i & 1) ? b >> 4 : b & 15; if (!c) continue;
+                img.setPixel((t % 4) * 8 + i % 8, (t / 4) * 8 + i / 8, earned ? bgr555(pal + 0x28 + 32 + c * 2) : qRgb(0x58, 0x60, 0x68));   // gold / silhouette
+            }
+        cache[key] = img; return img;
+    }
+};
+
 struct Sprites
 {
     HGTGhost::Narc narc; std::map<int, QImage> cache;
@@ -760,9 +782,9 @@ public:
 private:
     EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0, port = 0, instance = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
-    Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites;
+    Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites; Badges badges;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
-    int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite; Soul Link is always shown
+    int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite, 3 Badges; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
     // --- data ---
@@ -860,7 +882,7 @@ private:
     void poll()
     {
         NDS* nds = emu->getNDS(); if (!nds) return;
-        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); } }
+        if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); badges.narc.load(rom, {"a", "0", "4", "9"}); } }
         if (readParty(*nds)) updateLog();
         applySprite(*nds);
         send(); update();
@@ -987,7 +1009,7 @@ private:
     // New features = one more tile + one more page.
     void tabBar(QPainter& g, int& y, const std::vector<Pair>& ps)
     {
-        const char* names[] = {"Graveyard", "Sprite"}; int n = 2, tw = 64, x0 = (width() - n * (tw + 8)) / 2 + 4;
+        const char* names[] = {"Graveyard", "Sprite", "Badges"}; int n = 3, tw = 64, x0 = (width() - n * (tw + 8)) / 2 + 4;
         int graves = 0; for (auto& p : ps) if (pairDead(p)) graves++;
         tabRects.clear(); QFont f = g.font();
         for (int i = 0; i < n; i++)
@@ -1001,7 +1023,8 @@ private:
                 g.setPen(QPen(cFrame, 2)); g.drawLine(cx, iy + 7, cx, iy + 17); g.drawLine(cx - 4, iy + 10, cx + 4, iy + 10);
                 if (graves) { g.setPen(Qt::NoPen); g.setBrush(cRed); g.drawEllipse(r.right() - 18, r.y() + 2, 16, 16); g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(r.right() - 18, r.y() + 2, 16, 16), Qt::AlignCenter, QString::number(graves)); f.setBold(false); g.setFont(f); }
             }
-            else g.drawImage(cx - 16, iy - 4, thumb(spriteDef(spriteMm)));   // the trainer you are
+            else if (i == 1) g.drawImage(cx - 16, iy - 4, thumb(spriteDef(spriteMm)));   // the trainer you are
+            else g.drawImage(cx - 16, iy - 4, badges.get(0, johto & 1));   // Zephyr: gold once earned
             g.setPen(on ? cText : cWhite); f.setPointSize(8); g.setFont(f); g.drawText(QRect(r.x(), r.bottom() - 16, r.width(), 14), Qt::AlignCenter, names[i]); f.setPointSize(10); g.setFont(f);
         }
         y += 64;
@@ -1081,6 +1104,33 @@ private:
         if (!graves) { g.setPen(cWhite); g.drawText(16, y + 14, "Empty. Keep it that way."); y += 24; }
     }
 
+    // Badge case: own badges from the PlayerProfile (same bytes HGTNuzlocke uses for the level cap). The friend's badges are not in
+    // any sync packet (ghost, HGSL, HGNZ), so only our own are shown.
+    void pageBadges(QPainter& g, int& y)
+    {
+        int W = width(); QFont f = g.font();
+        header(g, y, "BADGE CASE");
+        static const char* kNames[16] = {"Zephyr", "Hive", "Plain", "Fog", "Storm", "Mineral", "Glacier", "Rising",
+                                         "Boulder", "Cascade", "Thunder", "Rainbow", "Soul", "Marsh", "Volcano", "Earth"};
+        for (int region = 0; region < 2; region++)
+        {
+            uint8_t bits = region ? kanto : johto;
+            g.setPen(cWhite); f.setBold(true); g.setFont(f);
+            g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, QString("%1  %2/8").arg(region ? "KANTO" : "JOHTO").arg(__builtin_popcount(bits)));
+            f.setBold(false); g.setFont(f); y += 20;
+            int cw = (W - 16) / 4;
+            for (int i = 0; i < 8; i++)
+            {
+                bool got = bits >> i & 1; QRect c(8 + (i % 4) * cw, y + (i / 4) * 58, cw - 4, 54);
+                g.setPen(QPen(got ? cGold : cBrown.lighter(140), got ? 2 : 1)); g.setBrush(got ? cSlot : cSlotDead); g.drawRoundedRect(c.adjusted(1, 1, -1, -1), 4, 4);
+                g.drawImage(c.center().x() - 16, c.y() + 4, badges.get(region * 8 + i, got));
+                g.setPen(got ? cText : cMuted); f.setPointSize(8); g.setFont(f); g.drawText(QRect(c.x(), c.bottom() - 15, c.width(), 13), Qt::AlignCenter, kNames[region * 8 + i]); f.setPointSize(10); g.setFont(f);
+            }
+            y += 2 * 58 + 6;
+        }
+        g.setPen(cMuted); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, QString("%1's badges are not synced yet").arg(peerName)); y += 22;
+    }
+
     void pageSprite(QPainter& g, int& y)
     {
         int W = width(); QFont f = g.font();
@@ -1125,7 +1175,7 @@ private:
         }
         pageSoulLink(g, y, ps);
         y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
-        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y);
+        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y); else if (page == 3) pageBadges(g, y);
         y += 8;
         if (y != contentHeight) { contentHeight = y; setMinimumHeight(y); }
     }
