@@ -76,6 +76,13 @@ std::mutex inviteMx; HGTogether::InviteStatus invitePub;   // kopie voor het doc
 const uint32_t kFlagsBlk = 0x170 * 2 + 2912 / 8, kTempVarBytes = 0x20 * 2;
 std::vector<u8> storySnap, storyPending; int storyState = 0; uint32_t storyIdle = 0;
 // LEARNLOG van de EXPJ-cave (bench/hgtpatch.py): u32 aantal, 8x {u16 soort, u16 zet (|0x8000 = slots vol, overgeslagen)}
+// Wegvallen tijdens een co-op-battle: elke 30 frames een HGTH-hartslag (ook in de battle, posities gaan alleen in de
+// overworld). START zet de foutdetectie van de link uit; hoort de fork 5 s niets terwijl HGT.active = 1 (battle loopt),
+// dan zet hij battleOutcomeFlag (BattleSystem+0x2420) op 2 = verloren: BattleContext_Main springt naar het einde, daarna
+// het gewone verliespad (COPY, sluiten, whiteout). Zonder hartslag van de ander (oudere build) doet de bewaker niets.
+// STAND 2026-10-21: werkt nog niet (een ander foutpad toont na ~20 s toch het comm-error-scherm, en de vlag brak de
+// battle-intro niet af), daarom alleen met HGT_ABORT_ON_SILENCE=1. De hartslag zelf is onschuldig en blijft aan.
+uint32_t peerHeard = 0; bool battleAborted = false;
 const uint32_t kLearnLog = 0x02078D00; std::mutex learnMx; std::vector<HGTogether::LearnNotice> learnNotices;
 // Is de hook er echt (scriptcommando 213 -> onze TB-cave)? Zonder hook (ongepatchte ROM/andere states) staat op kSignal
 // gewone code: die niet als sein lezen en ook geen joiner-script injecteren (9019 bestaat dan niet).
@@ -422,6 +429,16 @@ void HGTogether::tick(EmuInstance* emu)
         if (!online) { fprintf(stderr, "HGT: trainerbattle %u, vriend offline\n", t); decide(false); }
         else { send("HGTB", t); fprintf(stderr, "HGT: trainerbattle %u -> uitnodiging naar de ander\n", t); if (autoYes) { inv.mine = true; inv.phase = 1; } }
     }
+    if (frame % 30 == 0) send("HGTH", 0);
+    for (const BattleMsg& m : netMsgs) if (!memcmp(m.tag, "HGTH", 4)) peerHeard = frame;
+    static const bool abortOnSilence = [] { const char* e = getenv("HGT_ABORT_ON_SILENCE"); return e && *e && *e != '0'; }();   // experiment, standaard uit
+    if (abortOnSilence && hook && nds.ARM9Read32(kSignal + 20) == 1 && peerHeard && frame - peerHeard > 300 && !battleAborted)
+    {
+        uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0, pm = inRam(fs) ? nds.ARM9Read32(fs) : 0;
+        uint32_t child = inRam(pm) ? nds.ARM9Read32(pm + 4) : 0, bsys = inRam(child) ? nds.ARM9Read32(child + 0x1C) : 0;
+        if (inRam(bsys)) { nds.ARM9Write8(bsys + 0x2420, 2); battleAborted = true; fprintf(stderr, "HGT: de ander is weg (%u s stil) -> battle afgebroken als verloren\n", (frame - peerHeard) / 60); }
+    }
+    if (nds.ARM9Read32(kSignal + 20) != 1) battleAborted = false;
     for (const BattleMsg& m : netMsgs)
     {
         if (!memcmp(m.tag, "HGTB", 4)) { if (hook && inv.role == 0) { inv = InviteRun{}; inv.role = 2; inv.trainer = m.trainer; inv.until = frame + kInviteFrames;
