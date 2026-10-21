@@ -4,6 +4,7 @@
 // HGT_DUMP_DIR=map voor een PPM van het bovenscherm elke 60 frames (optioneel, voor headless tests).
 // shortcut: één peer, geen handshake, plain UDP; upgraden naar ENet/relay zodra de launcher (fase 3) er is.
 #include "HGTogether.h"
+#include "HGTGhost.h"
 #include "EmuInstance.h"
 #include "NDS.h"
 #include "GPU.h"
@@ -33,10 +34,9 @@ using namespace melonDS;
 
 namespace
 {
-struct State { int32_t mapId, x, z, facing, px, pz; uint32_t frame; };   // px/pz: positionVector (fx32)
+struct State { int32_t mapId, x, z, facing, px, pz; uint32_t frame; HGTGhost::Info info; };   // px/pz: positionVector (fx32)
 
 const uint32_t kFieldSysLiteral = 0x0203E304;   // literal = &sFieldSysPtr (Sacred Gold / US HG)
-const int kPlayerSX = 128, kPlayerSY = 97;       // schermpositie van de eigen speler: midden, voeten op y=97 (gemeten)
 const uint32_t kPeerTimeout = 180;               // frames zonder pakket -> ghost verbergen
 
 bool enabled = false, initDone = false;
@@ -63,6 +63,7 @@ bool readState(NDS& nds, State& s)
     s.mapId = nds.ARM9Read32(loc);
     s.x = nds.ARM9Read32(mo + 0x64); s.z = nds.ARM9Read32(mo + 0x6C); s.facing = nds.ARM9Read32(mo + 0x28);
     s.px = nds.ARM9Read32(mo + 0x70); s.pz = nds.ARM9Read32(mo + 0x78);
+    HGTGhost::readInfo(nds, s.info);
     return true;
 }
 
@@ -112,18 +113,9 @@ void exchange()
 void drawGhost(u32* fb)
 {
     // 1 tile = 16 wereld-eenheden (fx32) = 16 px; verticaal benaderd met dezelfde schaal (perspectief later).
-    // shortcut: ghost = doorschijnende kopie van de eigen spelersprite (16x24 px rond het midden), dus zelfde
-    // geslacht/outfit als jijzelf; echte sprite uit de ROM zodra we OAM-injectie doen.
     int dx = (peer.px - me.px) >> 12, dy = (peer.pz - me.pz) >> 12;
     if (dx == 0 && dy == 0) return;
-    for (int y = 0; y < 24; y++)
-        for (int x = 0; x < 16; x++)
-        {
-            int sx = kPlayerSX - 8 + x, sy = kPlayerSY - 23 + y, tx = sx + dx, ty = sy + dy;
-            if (sx < 0 || sx >= 256 || sy < 0 || sy >= 192 || tx < 0 || tx >= 256 || ty < 0 || ty >= 192) continue;
-            u32 src = fb[sy * 256 + sx], dst = fb[ty * 256 + tx];
-            fb[ty * 256 + tx] = (((src >> 1) & 0x7F7F7F7F) + ((dst >> 1) & 0x7F7F7F7F)) | 0xFF000000 | 0x00200020;   // 50/50 + paarse zweem
-        }
+    HGTGhost::draw(fb, dx, dy, peer.facing, peer.px, peer.pz, frame, peer.info);   // sprite + naam van de ander (HGTGhost.cpp)
 }
 
 void dump(const u32* fb)
@@ -311,7 +303,7 @@ void HGTogether::tick(EmuInstance* emu)
     if (!initDone) init();
     if (!enabled || !emu->nds) return;
     frame++;
-    if (frame == 1) startLan(emu);
+    if (frame == 1) { startLan(emu); HGTGhost::init(emu->baseROMDir + "/" + emu->baseROMName); }
     if (frame == 2) if (const char* st = getenv("HGT_LOADSTATE")) if (*st) fprintf(stderr, "HGT: savestate %s %s\n", st, emu->loadState(st) ? "geladen" : "MISLUKT");
     NDS& nds = *emu->nds;
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
