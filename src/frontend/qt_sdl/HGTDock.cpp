@@ -658,8 +658,10 @@ void decrypt(uint8_t* d, int len, uint32_t seed)
 bool readMon(NDS& nds, uint32_t a, Mon& m, bool* nicked = nullptr)
 {
     uint8_t raw[0xEC]; for (int i = 0; i < 0xEC; i++) raw[i] = nds.ARM9Read8(a + i);
-    uint32_t pid; uint16_t checksum; memcpy(&pid, raw, 4); memcpy(&checksum, raw + 6, 2);
-    uint8_t blocks[0x80]; memcpy(blocks, raw + 8, 0x80); decrypt(blocks, 0x80, checksum);
+    uint32_t pid; uint16_t flags, checksum; memcpy(&pid, raw, 4); memcpy(&flags, raw + 4, 2); memcpy(&checksum, raw + 6, 2);
+    // The game sometimes keeps a record decrypted in RAM for a few frames (+4: bit 0 partyDecrypted, bit 1 boxDecrypted; tip Kyogre):
+    // then those bytes are already plain and must not be XOR'd again (we only read, but would show nonsense levels/HP).
+    uint8_t blocks[0x80]; memcpy(blocks, raw + 8, 0x80); if (!(flags & 2)) decrypt(blocks, 0x80, checksum);
     uint32_t sum = 0; for (int i = 0; i < 0x80; i += 2) { uint16_t v; memcpy(&v, blocks + i, 2); sum += v; }
     if ((sum & 0xFFFF) != checksum) return false;
     const uint8_t* order = kOrder[((pid >> 13) & 0x1F) % 24];
@@ -668,7 +670,7 @@ bool readMon(NDS& nds, uint32_t a, Mon& m, bool* nicked = nullptr)
     memcpy(&m.species, blk(0), 2);
     uint32_t ivs; memcpy(&ivs, blk(1) + 0x10, 4); m.egg = (ivs >> 30) & 1; if (nicked) *nicked = ivs >> 31;   // block B +0x10: bit 31 hasNickname (as HGTNuzlocke)
     for (int i = 0; i < 10; i++) { uint16_t c; memcpy(&c, blk(2) + 2 * i, 2); if (c == 0xFFFF) break; m.nick[i] = HGTGhost::dsChar(c); }
-    uint8_t party[0x64]; memcpy(party, raw + 0x88, 0x64); decrypt(party, 0x64, pid);
+    uint8_t party[0x64]; memcpy(party, raw + 0x88, 0x64); if (!(flags & 1)) decrypt(party, 0x64, pid);
     m.level = party[4]; memcpy(&m.hp, party + 6, 2); memcpy(&m.maxhp, party + 8, 2);
     return true;
 }
