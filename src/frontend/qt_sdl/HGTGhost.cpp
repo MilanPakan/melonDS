@@ -103,6 +103,14 @@ bool project(const Cam& c, const int32_t* p, double& sx, double& sy, double& w) 
 }
 }
 
+bool overworld(NDS& nds)
+{
+    uint32_t var = nds.ARM9Read32(kFieldSysLiteral); if (!inRam(var)) return false;
+    uint32_t fs = nds.ARM9Read32(var);               if (!inRam(fs)) return false;
+    uint32_t pm = nds.ARM9Read32(fs);                if (!inRam(pm)) return false;
+    return !inRam(nds.ARM9Read32(pm + 4));
+}
+
 void readInfo(NDS& nds, Info& i)
 {
     i.sprite = (int16_t)mySprite.load(); i.frames = (uint8_t)myFrames.load();

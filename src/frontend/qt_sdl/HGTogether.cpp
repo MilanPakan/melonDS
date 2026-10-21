@@ -135,6 +135,9 @@ void exchange()
 
 void drawGhosts(void* top, bool cpu, NDS& nds)
 {
+    static bool shown = true; bool ow = HGTGhost::overworld(nds);
+    if (ow != shown) { shown = ow; fprintf(stderr, "HGT: ghost %s (f%u)\n", ow ? "weer zichtbaar" : "verborgen: geen overworld", frame); }
+    if (!ow) return;   // battle/menu-app actief: geen ghost of label over dat scherm (bevinding Metagross)
     int32_t mine[3] = { me.px, me.info.py, me.pz };
     for (size_t i = 0; i < peers.size(); i++)
     {
