@@ -19,6 +19,7 @@
 #include <QFile>
 #include <QHostAddress>
 #include <QDateTime>
+#include <QJsonObject>
 #include <QGuiApplication>
 #include <QMainWindow>
 #include <QScreen>
@@ -589,6 +590,40 @@ const char* const kMapNames[] = {
 "Unused",
 "Pokémon League Entrance Wifi Room",
 "Id Max"};
+// Map section names (pret include/constants/map_sections.h, MAPSEC_* title-cased): the Nuzlocke area unit (HGTNuzlocke.cpp).
+const char* const kMapsecNames[] = {
+    "Mystery Zone", "Twinleaf Town", "Sandgem Town", "Floaroma Town", "Solaceon Town", "Celestic Town", "Jubilife City",
+    "Canalave City", "Oreburgh City", "Eterna City", "Hearthome City", "Pastoria City", "Veilstone City", "Sunyshore City",
+    "Snowpoint City", "Pokémon League", "Route 201", "Route 202", "Route 203", "Route 204", "Route 205", "Route 206",
+    "Route 207", "Route 208", "Route 209", "Route 210", "Route 211", "Route 212", "Route 213", "Route 214", "Route 215",
+    "Route 216", "Route 217", "Route 218", "Route 219", "Route 220", "Route 221", "Route 222", "Route 223", "Route 224",
+    "Route 225", "Route 226", "Route 227", "Route 228", "Route 229", "Route 230", "Oreburgh Mine", "Valley Windworks",
+    "Eterna Forest", "Fuego Ironworks", "Mt Coronet", "Spear Pillar", "Great Marsh", "Solaceon Ruins", "Victory Road S",
+    "Pal Park", "Amity Square", "Ravaged Path", "Floaroma Meadow", "Oreburgh Gate", "Fullmoon Island", "Sendoff Spring",
+    "Turnback Cave", "Flower Paradise", "Snowpoint Temple", "Wayward Cave", "Ruin Maniac Cave", "Maniac Tunnel", "Trophy Garden",
+    "Iron Island", "Old Chateau", "Galactic Hq", "Verity Lakefront", "Valor Lakefront", "Acuity Lakefront", "Spring Path",
+    "Lake Verity", "Lake Valor", "Lake Acuity", "Newmoon Island", "Battle Tower", "Fight Area", "Survival Area", "Resort Area",
+    "Stark Mountain", "Seabreak Path", "Hall Of Origin", "Verity Cavern", "Valor Cavern", "Acuity Cavern", "Jubilife Tv",
+    "Poketch Co", "Gts", "Trainers School", "Mining Museum", "Flower Shop", "Cycle Shop", "Contest Hall", "Poffin House",
+    "Foreign Building", "Pokémon Day Care", "Veilstone Store", "Game Corner", "Canalave Library", "Vista Lighthouse",
+    "Sunyshore Market", "Pokémon Mansion", "Footstep House", "Cafe", "Grand Lake", "Restaurant", "Battle Park",
+    "Battle Frontier", "Battle Factory", "Battle Castle", "Battle Arcade", "Battle Hall", "Distortion World", "Global Terminal",
+    "Villa", "Battleground", "Rotoms Room", "Tg Eterna Bldg", "Iron Ruins", "Iceberg Ruins", "Rock Peak Ruins", "New Bark Town",
+    "Cherrygrove City", "Violet City", "Azalea Town", "Cianwood City", "Goldenrod City", "Olivine City", "Ecruteak City",
+    "Mahogany Town", "Lake Of Rage", "Blackthorn City", "Mt Silver", "Pallet Town", "Viridian City", "Pewter City",
+    "Cerulean City", "Lavender Town", "Vermilion City", "Celadon City", "Fuchsia City", "Cinnabar Island", "Indigo Plateau",
+    "Saffron City", "Route 1", "Route 2", "Route 3", "Route 4", "Route 5", "Route 6", "Route 7", "Route 8", "Route 9",
+    "Route 10", "Route 11", "Route 12", "Route 13", "Route 14", "Route 15", "Route 16", "Route 17", "Route 18", "Route 19",
+    "Route 20", "Route 21", "Route 22", "Route 23", "Route 24", "Route 25", "Route 26", "Route 27", "Route 28", "Route 29",
+    "Route 30", "Route 31", "Route 32", "Route 33", "Route 34", "Route 35", "Route 36", "Route 37", "Route 38", "Route 39",
+    "Route 40", "Route 41", "Route 42", "Route 43", "Route 44", "Route 45", "Route 46", "Route 47", "Route 48", "Digletts Cave",
+    "Mt Moon", "Cerulean Cave", "Rock Tunnel", "Power Plant", "Safari Zone", "Seafoam Islands", "Sprout Tower", "Bell Tower",
+    "Burned Tower", "National Park", "Radio Tower", "Ruins Of Alph", "Union Cave", "Slowpoke Well", "Lighthouse",
+    "Team Rocket Hq", "Ilex Forest", "Goldenrod Tunnel", "Mt Mortar", "Ice Path", "Whirl Islands", "Mt Silver Cave", "Dark Cave",
+    "Victory Road Jk", "Dragons Den", "Tohjo Falls", "Viridian Forest", "Pokeathlon Dome", "Ss Aqua", "Safari Zone Gate",
+    "Cliff Cave", "Frontier Access", "Bellchime Trail", "Sinjoh Ruins", "Embedded Tower", "Pokewalker", "Cliff Edge Gate"
+};
+QString mapsecName(int m) { return m >= 0 && m < (int)(sizeof kMapsecNames / sizeof *kMapsecNames) && *kMapsecNames[m] ? QString(kMapsecNames[m]) : QString("Area %1").arg(m); }
 QString areaName(int32_t a) { return a >= 0 && a < (int)(sizeof kMapNames / sizeof *kMapNames) && *kMapNames[a] ? QString(kMapNames[a]) : QString("Map %1").arg(a); }
 // Level caps from docs/levelcaps.md, per badge bit (pret constants/badge.h: Zephyr..Rising = Johto, Boulder..Earth = Kanto).
 struct Boss { const char* name; int cap; };
@@ -787,6 +822,10 @@ private:
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
     Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites; Badges badges;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
+    // Nuzlocke state, read-only from <rom>.nuzlocke.json (HGTNuzlocke.cpp writes it: {"me"|"peer": {encs:[{area=mapsec, species, pid,
+    // outcome 0 pending/1 caught/2 missed/3 reroll, ts}], dead:[pid], banned:[pid]}}). Missing file = Nuzlocke off.
+    struct NzEnc { int area, outcome; qint64 ts; };
+    int nzTicks = 0; bool nzOn = false; std::vector<NzEnc> nzEnc[2]; std::vector<uint32_t> nzDead[2]; int mapsec = -1;
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite, 3 Badges; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
@@ -851,6 +890,56 @@ private:
     }
     void saveSprite() { QFile f(romPath() + ".sprite"); if (f.open(QIODevice::WriteOnly)) f.write(QByteArray::number(spriteMm)); }
 
+    void loadNuzlocke()
+    {
+        QString rom = romPath(); QFile f(rom + ".nuzlocke.json"); nzOn = !rom.isEmpty() && f.open(QIODevice::ReadOnly); if (!nzOn) return;
+        QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); const char* keys[2] = {"me", "peer"};
+        for (int w = 0; w < 2; w++)
+        {
+            QJsonObject p = o[keys[w]].toObject(); nzEnc[w].clear(); nzDead[w].clear();
+            for (auto v : p["encs"].toArray()) { QJsonObject e = v.toObject(); nzEnc[w].push_back({e["area"].toInt(), e["outcome"].toInt(), (qint64)e["ts"].toDouble()}); }
+            for (auto v : p["dead"].toArray()) nzDead[w].push_back((uint32_t)v.toDouble());
+        }
+    }
+    // Who picks first in an area: areas in order of discovery (earliest encounter of either player), starter area = 0 of
+    // HGT_NUZLOCKE_STARTER, then alternating; a new area gets the next number. Same rule as HGTNuzlocke::firstPicker.
+    int firstPicker(int area) const
+    {
+        std::vector<std::pair<qint64, int>> areas;
+        for (int w = 0; w < 2; w++) for (auto& e : nzEnc[w])
+        {
+            auto it = std::find_if(areas.begin(), areas.end(), [&](auto& a) { return a.second == e.area; });
+            if (it == areas.end()) areas.push_back({e.ts, e.area}); else it->first = std::min(it->first, e.ts);
+        }
+        std::sort(areas.begin(), areas.end());
+        int n = (int)areas.size(); for (int i = 0; i < (int)areas.size(); i++) if (areas[i].second == area) n = i;
+        const char* sf = getenv("HGT_NUZLOCKE_STARTER"); return (n + 1 + (sf && atoi(sf) ? 1 : 0)) % 2;
+    }
+    QString deadNames(int w)
+    {
+        QStringList l; for (uint32_t pid : nzDead[w]) { Entry* e = find(w ? peerLog : log, pid); l << (e && e->nick[0] ? QString::fromLatin1(e->nick) : QString("?")); }
+        return l.isEmpty() ? QString("none") : l.join(", ");
+    }
+    void nuzlockeBox(QPainter& g, int& y)
+    {
+        int W = width(); QFont f = g.font();
+        if (!nzOn) { g.setPen(cMuted); g.drawText(QRect(16, y, W - 32, 18), Qt::AlignVCenter, "Nuzlocke off"); y += 22; return; }
+        int me = getenv("HGT_INSTANCE") && atoi(getenv("HGT_INSTANCE")) ? 1 : 0, first = firstPicker(mapsec);
+        QString myN = myName, peerN = peerName, firstN = first == me ? myN : peerN;
+        auto mine = std::find_if(nzEnc[0].begin(), nzEnc[0].end(), [&](auto& e) { return e.area == mapsec; });
+        static const char* kOut[4] = {"in progress", "caught", "missed", "reroll"};
+        QString status = mine == nzEnc[0].end() ? "free" : kOut[std::clamp(mine->outcome, 0, 3)];
+        Boss cap = levelCap(johto, kanto, gameClear);
+        QStringList lines = { QString("%1  %2  first pick: %3").arg(mapsec >= 0 ? mapsecName(mapsec) : QString("?"), QChar(0x00b7), firstN),
+                              QString("Your encounter here: %1").arg(status),
+                              QString("Level cap %1  %2  next boss: %3").arg(cap.cap).arg(QChar(0x00b7)).arg(cap.name),
+                              QString("Deaths %1 (%2): %3").arg(myN).arg(nzDead[0].size()).arg(deadNames(0)),
+                              QString("Deaths %1 (%2): %3").arg(peerN).arg(nzDead[1].size()).arg(deadNames(1)) };
+        g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 18 * lines.size() + 4); f.setPointSize(9); g.setFont(f);
+        for (int i = 0; i < lines.size(); i++) { g.setPen(i < 3 ? cText : cMuted); g.drawText(QRect(16, y + 2 + i * 18, W - 32, 18), Qt::AlignVCenter, lines[i]); }
+        f.setPointSize(10); g.setFont(f); y += 18 * lines.size() + 10;
+    }
+
     void loadJson()
     {
         QFile f(jsonPath); if (!f.open(QIODevice::ReadOnly)) return;
@@ -887,6 +976,8 @@ private:
         NDS* nds = emu->getNDS(); if (!nds) return;
         if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); badges.narc.load(rom, {"a", "0", "4", "9"}); } }
         if (readParty(*nds)) updateLog();
+        if (mapId >= 0 && mapId < 540) mapsec = nds->ARM9Read8(0x020F6BE0 + mapId * 0x18 + 18);   // map header -> mapsec, as HGTNuzlocke
+        if (nzTicks++ % 8 == 0) loadNuzlocke();   // every 2 s
         applySprite(*nds);
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
@@ -1186,6 +1277,7 @@ private:
                        .arg(p.connected ? QString("%1s ago").arg(p.since, 0, 'f', 1) : QString("no signal %1s").arg((int)p.since)));
             y += 20;
         }
+        nuzlockeBox(g, y);
         pageSoulLink(g, y, ps);
         y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
         if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y); else if (page == 3) pageBadges(g, y);
