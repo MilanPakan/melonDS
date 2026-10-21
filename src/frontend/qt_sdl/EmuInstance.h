@@ -83,6 +83,7 @@ int getEventKeyVal(QKeyEvent* event);
 
 class EmuInstance;
 namespace HGTogether { void tick(EmuInstance*); bool input(EmuInstance*); }
+namespace HGTNuzlocke { void tick(EmuInstance*); }
 
 class EmuInstance
 {
@@ -384,6 +385,7 @@ private:
     friend class EmuThread;
     friend void HGTogether::tick(EmuInstance*);
     friend bool HGTogether::input(EmuInstance*);
+    friend void HGTNuzlocke::tick(EmuInstance*);
     friend class MainWindow;
 };
 

@@ -14,6 +14,7 @@ set(SOURCES_QT_SDL
     HGTogether.cpp
     HGTDock.cpp
     HGTGhost.cpp
+    HGTNuzlocke.cpp
     CheatImportDialog.cpp
     CheatsDialog.cpp
     Config.cpp
