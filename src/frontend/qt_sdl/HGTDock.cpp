@@ -658,7 +658,8 @@ struct Icons   // party icons: NARC a/0/2/0 (NCLR member 0, NCGR per species)
                 img.setPixel(x, y, bgr555(colors + c * 2));
             }
         }
-        cache[naix] = img; return img;
+        if (!narc.data.empty()) cache[naix] = img;   // not before the ROM NARC is loaded (poll), else the blank image sticks
+        return img;
     }
 };
 
@@ -681,7 +682,8 @@ struct Badges
                 int b = chr[0x30 + (badge * 12 * 16 + t) * 32 + i / 2], c = (i & 1) ? b >> 4 : b & 15; if (!c) continue;
                 img.setPixel((t % 4) * 8 + i % 8, (t / 4) * 8 + i / 8, earned ? bgr555(pal + 0x28 + 32 + c * 2) : qRgb(0x58, 0x60, 0x68));   // gold / silhouette
             }
-        cache[key] = img; return img;
+        if (!narc.data.empty()) cache[key] = img;   // not before the ROM NARC is loaded (poll), else the blank image sticks
+        return img;
     }
 };
 
@@ -700,7 +702,8 @@ struct Sprites
                 int b = d[tex + frame * 512 + (y * 32 + x) / 2], c = (x & 1) ? b >> 4 : b & 15; if (!c) continue;
                 img.setPixel(x, y, bgr555(d + pal + c * 2));
             }
-        cache[key] = img; return img;
+        if (!narc.data.empty()) cache[key] = img;   // not before the ROM NARC is loaded (poll), else the blank image sticks
+        return img;
     }
 };
 
