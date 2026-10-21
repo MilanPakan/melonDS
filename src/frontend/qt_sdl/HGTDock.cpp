@@ -19,6 +19,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QFile>
+#include <QFileInfo>
+#include <QCoreApplication>
+#include <set>
 #include <QHostAddress>
 #include <QDateTime>
 #include <QJsonObject>
@@ -817,6 +820,8 @@ public:
         timer.start(250);
         if (const char* e = getenv("HGT_SPRITE")) spriteMm = atoi(e);   // mmodel member, for the launcher / headless tests; else <rom>.sprite (poll)
         if (const char* e = getenv("HGT_DOCK_PAGE")) page = atoi(e);   // headless test: dump a given page
+        if (const char* e = getenv("HGT_GUIDE_TRAINER")) guideTrainer = atoi(e);   // headless test: open a team in the guide
+        wildOpen = getenv("HGT_GUIDE_WILD") != nullptr;
     }
 
 private:
@@ -831,6 +836,16 @@ private:
     // View switch (docs/camera.md): diorama camera (HGT_CAM 30,45,1 unless HGT_CAM is set) and sharp view (OpenGL renderer at 4x).
     // Stored next to the ROM in <rom>.view as "diorama sharp" (0/1 each), applied at start; the launcher has no setting for it.
     bool viewDiorama = false, viewSharp = false; QRect dioramaRect, sharpRect;
+    // Guide (docs/guide.json, built from the ROM by bench/guide.py; format agreed with Ampharos): per mapsec the trainers with
+    // their teams and the wild encounters, plus the boss list in badge order. Looked up next to the ROM, then docs/ next to the repo.
+    struct GMon { int species = 0, level = 0; QString name, item, ability; QStringList moves; };
+    struct GTrainer { int id = 0; QString cls, name; bool boss = false; std::vector<GMon> party; };
+    struct GWild { int species = 0, min = 0, max = 0, rate = 0; QString name; };
+    struct GMap { QString name; std::vector<GTrainer> trainers; std::vector<std::pair<QString, std::vector<GWild>>> wild; };
+    struct GBoss { int badge = -1, mapsec = -1, trainer = 0, cap = 0; QString name; };
+    std::map<int, GMap> guide; std::vector<GBoss> bosses; bool guideTried = false; QString guidePath;
+    std::set<int> beaten; int guideTrainer = -1; bool wildOpen = false;   // guideTrainer: open team view (-1 = list)
+    std::vector<std::pair<QRect, int>> trainerRects; QRect backRect, wildRect;
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite, 3 Badges; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
@@ -928,6 +943,138 @@ private:
         f.setPointSize(10); g.setFont(f); y += 28;
     }
 
+    void loadGuide()
+    {
+        guideTried = true; QString rom = romPath(); if (rom.isEmpty()) { guideTried = false; return; }
+        for (QString c : {QFileInfo(rom).absolutePath() + "/guide.json", QCoreApplication::applicationDirPath() + "/../../docs/guide.json"})
+        {
+            QFile f(c); if (!f.open(QIODevice::ReadOnly)) continue;
+            QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); guidePath = c;
+            QJsonObject maps = o["maps"].toObject();
+            for (auto it = maps.begin(); it != maps.end(); ++it)
+            {
+                QJsonObject m = it.value().toObject(); GMap gm; gm.name = m["name"].toString();
+                for (auto tv : m["trainers"].toArray())
+                {
+                    QJsonObject t = tv.toObject(); GTrainer gt{t["id"].toInt(), t["class"].toString(), t["name"].toString(), t["boss"].toBool(), {}};
+                    for (auto pv : t["party"].toArray())
+                    {
+                        QJsonObject pm = pv.toObject(); GMon g{pm["species"].toInt(), pm["level"].toInt(), pm["species_name"].toString(), pm["item"].toString(), pm["ability"].toString(), {}};
+                        for (auto mv : pm["moves"].toArray()) g.moves << mv.toString();
+                        gt.party.push_back(g);
+                    }
+                    gm.trainers.push_back(gt);
+                }
+                QJsonObject w = m["wild"].toObject();
+                for (const char* k : {"morning", "day", "night", "surf", "rocksmash", "oldrod", "goodrod", "superrod"})
+                {
+                    std::vector<GWild> list;
+                    for (auto ev : w[k].toArray()) { QJsonObject e = ev.toObject(); list.push_back({e["species"].toInt(), e["min"].toInt(), e["max"].toInt(), e["rate"].toInt(), e["species_name"].toString()}); }
+                    if (!list.empty()) gm.wild.push_back({k, list});
+                }
+                guide[it.key().toInt()] = gm;
+            }
+            for (auto bv : o["bosses"].toArray()) { QJsonObject b = bv.toObject(); bosses.push_back({b["badge"].toInt(-1), b["mapsec"].toInt(-1), b["trainer"].toInt(), b["cap"].toInt(), b["name"].toString()}); }
+            fprintf(stderr, "HGT: guide %s (%zu maps, %zu bosses)\n", c.toUtf8().constData(), guide.size(), bosses.size());
+            return;
+        }
+    }
+    // Trainer flags (pret flags.h: FLAG_TRAINER(t) = 0x550 + t) in SaveVarsFlags = save array 4, flags after 0x170 u16 vars.
+    void readBeaten(NDS& nds)
+    {
+        uint32_t flags = saveData + 0x10 + nds.ARM9Read32(saveData + 0x23014 + 4 * 0x10 + 8) + 0x2E0; beaten.clear();
+        static uint32_t logged = 0; if (flags != logged) { logged = flags; fprintf(stderr, "HGT: trainer-flags op %08X\n", flags); }
+        auto check = [&](int id) { int f = 0x550 + id; if (nds.ARM9Read8(flags + f / 8) >> (f % 8) & 1) beaten.insert(id); };
+        auto it = guide.find(guideMapsec()); if (it != guide.end()) for (auto& t : it->second.trainers) check(t.id);
+        if (const GBoss* b = nextBoss()) check(b->trainer);
+    }
+    int guideMapsec() const { const char* e = getenv("HGT_GUIDE_MAP"); return e ? atoi(e) : mapsec; }   // HGT_GUIDE_MAP: headless test of another area
+    // Next boss: first gym leader whose badge is missing; E4/Lance (-1) count until the game is cleared; Red (last) after that.
+    const GBoss* nextBoss() const
+    {
+        for (size_t i = 0; i < bosses.size(); i++)
+        {
+            const GBoss& b = bosses[i];
+            if (b.badge >= 0 ? !((b.badge < 8 ? johto : kanto) >> (b.badge % 8) & 1) : (!gameClear || i + 1 == bosses.size())) return &b;
+        }
+        return nullptr;
+    }
+    const GTrainer* findTrainer(int id, int ms = -1) const
+    {
+        for (auto& [k, m] : guide) if (ms < 0 || k == ms) for (auto& t : m.trainers) if (t.id == id) return &t;
+        return nullptr;
+    }
+    void pageGuide(QPainter& g, int& y)
+    {
+        int W = width(); QFont f = g.font();
+        header(g, y, "GUIDE"); trainerRects.clear(); backRect = wildRect = QRect();
+        if (guide.empty()) { g.setPen(cWhite); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, "No guide.json found (next to the ROM or in docs/)"); y += 24; return; }
+        int ms = guideMapsec(); auto mit = guide.find(ms);
+        // location + next boss
+        QRect top(8, y, W - 16, 64); slotBox(g, top, false);
+        g.setPen(cText); f.setBold(true); g.setFont(f); g.drawText(top.x() + 10, top.y() + 18, mit != guide.end() && !mit->second.name.isEmpty() ? mit->second.name : mapsecName(ms)); f.setBold(false); g.setFont(f);
+        if (const GBoss* b = nextBoss())
+        {
+            const GTrainer* bt = findTrainer(b->trainer, b->mapsec);
+            g.setPen(cMuted); g.drawText(top.x() + 10, top.y() + 36, QString("Next boss: %1  %2  cap %3%4").arg(b->name, QChar(0x00b7)).arg(b->cap).arg(beaten.count(b->trainer) ? "  (beaten)" : ""));
+            if (bt) for (size_t i = 0; i < bt->party.size(); i++)
+            {
+                g.drawImage(top.x() + 8 + (int)i * 52, top.y() + 36, icons.get(bt->party[i].species, false).scaled(28, 28));
+                g.setPen(cText); f.setPointSize(8); g.setFont(f); g.drawText(top.x() + 36 + (int)i * 52, top.y() + 58, QString("%1").arg(bt->party[i].level)); f.setPointSize(10); g.setFont(f);
+            }
+        }
+        y += 70;
+        if (mit == guide.end()) { g.setPen(cWhite); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, "No trainers or wild data for this area."); y += 24; return; }
+        const GMap& m = mit->second;
+        if (guideTrainer >= 0)
+        {
+            const GTrainer* t = findTrainer(guideTrainer, ms);
+            backRect = QRect(8, y, 70, 22); g.setPen(QPen(cGold, 2)); g.setBrush(cSlot); g.drawRoundedRect(backRect.adjusted(1, 1, -1, -1), 6, 6);
+            g.setPen(cText); g.drawText(backRect, Qt::AlignCenter, QString("%1 Back").arg(QChar(0x25c0)));
+            if (t) { g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(88, y, W - 96, 22), Qt::AlignVCenter, QString("%1 %2").arg(t->cls, t->name)); f.setBold(false); g.setFont(f); }
+            y += 28;
+            if (t) for (auto& pm : t->party)
+            {
+                QStringList extra; if (!pm.item.isEmpty()) extra << pm.item; if (!pm.ability.isEmpty()) extra << pm.ability;
+                int h = pm.moves.isEmpty() ? 40 : 56; QRect r(8, y, W - 16, h); slotBox(g, r, false);
+                g.drawImage(r.x() + 6, r.y() + 4, icons.get(pm.species, false));
+                g.setPen(cText); f.setBold(true); g.setFont(f); g.drawText(r.x() + 44, r.y() + 17, QString("%1  Lv %2").arg(pm.name.isEmpty() ? QString("#%1").arg(pm.species) : pm.name).arg(pm.level)); f.setBold(false); g.setFont(f);
+                g.setPen(cMuted); f.setPointSize(9); g.setFont(f);
+                if (!extra.isEmpty()) g.drawText(r.x() + 44, r.y() + 33, extra.join("  " + QString(QChar(0x00b7)) + "  "));
+                if (!pm.moves.isEmpty()) g.drawText(QRect(r.x() + 44, r.y() + 36, r.width() - 50, 18), Qt::AlignVCenter, pm.moves.join(", "));
+                f.setPointSize(10); g.setFont(f); y += h + 4;
+            }
+            return;
+        }
+        g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, QString("TRAINERS (%1)").arg(m.trainers.size())); f.setBold(false); g.setFont(f); y += 20;
+        for (auto& t : m.trainers)
+        {
+            QRect r(8, y, W - 16, 26); trainerRects.push_back({r, t.id}); bool done = beaten.count(t.id);
+            g.setPen(QPen(t.boss ? cGold : cBrown.lighter(140), t.boss ? 2 : 1)); g.setBrush(done ? cSlotDead : cSlot); g.drawRoundedRect(r.adjusted(1, 1, -1, -1), 4, 4);
+            g.setPen(done ? cGreen : cMuted); g.drawText(QRect(r.x() + 6, r.y(), 18, r.height()), Qt::AlignCenter, done ? QString(QChar(0x2714)) : QString(QChar(0x25cb)));
+            g.setPen(done ? cMuted : cText); g.drawText(QRect(r.x() + 26, r.y(), r.width() - 110, r.height()), Qt::AlignVCenter, QString("%1 %2").arg(t.cls, t.name));
+            g.setPen(cMuted); g.drawText(QRect(r.right() - 90, r.y(), 84, r.height()), Qt::AlignVCenter | Qt::AlignRight, QString("%1 Pokémon %2").arg(t.party.size()).arg(QChar(0x25b8)));
+            y += 28;
+        }
+        if (m.wild.empty()) return;
+        y += 4; wildRect = QRect(8, y, W - 16, 22);
+        g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(wildRect.adjusted(4, 0, 0, 0), Qt::AlignVCenter, QString("%1 WILD").arg(QChar(wildOpen ? 0x25be : 0x25b8))); f.setBold(false); g.setFont(f); y += 24;
+        if (!wildOpen) return;
+        for (auto& [key, list] : m.wild)
+        {
+            g.setPen(cWhite); f.setPointSize(9); g.setFont(f); g.drawText(QRect(12, y, W - 24, 16), Qt::AlignVCenter, key.at(0).toUpper() + key.mid(1)); y += 16;
+            int cw = (W - 16) / 4;
+            for (size_t i = 0; i < list.size(); i++)
+            {
+                const GWild& e = list[i]; QRect c(8 + (int)(i % 4) * cw, y + (int)(i / 4) * 44, cw - 3, 42); slotBox(g, c, false);
+                g.drawImage(c.center().x() - 16, c.y() - 4, icons.get(e.species, false));
+                g.setPen(cText); f.setPointSize(7); g.setFont(f);
+                g.drawText(QRect(c.x(), c.bottom() - 13, c.width(), 12), Qt::AlignCenter, QString("%1 %2-%3 %4%").arg(e.name.left(8)).arg(e.min).arg(e.max).arg(e.rate));
+            }
+            y += (int)((list.size() + 3) / 4) * 44 + 4; f.setPointSize(10); g.setFont(f);
+        }
+    }
+
     void loadNuzlocke()
     {
         QString rom = romPath(); QFile f(rom + ".nuzlocke.json"); nzOn = !rom.isEmpty() && f.open(QIODevice::ReadOnly); if (!nzOn) return;
@@ -1015,6 +1162,8 @@ private:
         if (jsonPath.isEmpty()) { QString rom = romPath(); if (!rom.isEmpty() && QFile::exists(rom)) { jsonPath = rom + ".soullink.json"; loadJson(); loadSprite(rom); loadView(rom); icons.narc.load(rom, {"a", "0", "2", "0"}); sprites.narc.load(rom, {"a", "0", "8", "1"}); badges.narc.load(rom, {"a", "0", "4", "9"}); } }
         if (readParty(*nds)) updateLog();
         if (mapId >= 0 && mapId < 540) mapsec = nds->ARM9Read8(0x020F6BE0 + mapId * 0x18 + 18);   // map header -> mapsec, as HGTNuzlocke
+        if (!guideTried) loadGuide();
+        if (page == 4 && saveData) readBeaten(*nds);
         if (nzTicks++ % 8 == 0) loadNuzlocke();   // every 2 s
         // headless test of the runtime path: HGT_DOCK_TOGGLE=<s> flips both view switches once after <s> seconds (as a click would)
         if (const char* t = getenv("HGT_DOCK_TOGGLE")) if (nzTicks == atoi(t) * 4) { viewDiorama = !viewDiorama; viewSharp = !viewSharp; saveView(); applyView(); }
@@ -1066,6 +1215,13 @@ private:
         if (dioramaRect.contains(e->pos()) && !HGTCamera::envSet()) { viewDiorama = !viewDiorama; saveView(); applyView(); update(); return; }
         if (sharpRect.contains(e->pos())) { viewSharp = !viewSharp; saveView(); applyView(); update(); return; }
         for (int i = 0; i < (int)tabRects.size(); i++) if (tabRects[i].contains(e->pos())) { page = page == i + 1 ? 0 : i + 1; update(); return; }   // click again = close
+        if (page == 4)
+        {
+            if (backRect.contains(e->pos())) { guideTrainer = -1; update(); return; }
+            if (wildRect.contains(e->pos())) { wildOpen = !wildOpen; update(); return; }
+            for (auto& [r, id] : trainerRects) if (r.contains(e->pos())) { guideTrainer = id; update(); return; }
+            return;
+        }
         if (page != 2) return;
         for (int i = 0; i < (int)spriteCells.size(); i++)
             if (spriteCells[i].contains(e->pos()))
@@ -1145,7 +1301,7 @@ private:
     // New features = one more tile + one more page.
     void tabBar(QPainter& g, int& y, const std::vector<Pair>& ps)
     {
-        const char* names[] = {"Graveyard", "Sprite", "Badges"}; int n = 3, tw = 64, x0 = (width() - n * (tw + 8)) / 2 + 4;
+        const char* names[] = {"Graveyard", "Sprite", "Badges", "Guide"}; int n = 4, tw = 64, x0 = (width() - n * (tw + 8)) / 2 + 4;
         int graves = 0; for (auto& p : ps) if (pairDead(p)) graves++;
         tabRects.clear(); QFont f = g.font();
         for (int i = 0; i < n; i++)
@@ -1160,7 +1316,12 @@ private:
                 if (graves) { g.setPen(Qt::NoPen); g.setBrush(cRed); g.drawEllipse(r.right() - 18, r.y() + 2, 16, 16); g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(r.right() - 18, r.y() + 2, 16, 16), Qt::AlignCenter, QString::number(graves)); f.setBold(false); g.setFont(f); }
             }
             else if (i == 1) g.drawImage(cx - 16, iy - 4, thumb(spriteDef(spriteMm)));   // the trainer you are
-            else g.drawImage(cx - 16, iy - 4, badges.get(0, johto & 1));   // Zephyr: gold once earned
+            else if (i == 2) g.drawImage(cx - 16, iy - 4, badges.get(0, johto & 1));   // Zephyr: gold once earned
+            else                // guide: a little open book
+            {
+                g.setPen(QPen(cFrame, 1)); g.setBrush(cSlot); g.drawRect(cx - 14, iy + 4, 13, 20); g.drawRect(cx + 1, iy + 4, 13, 20);
+                g.setPen(QPen(cMuted, 1)); for (int l = 0; l < 4; l++) { g.drawLine(cx - 11, iy + 9 + l * 4, cx - 4, iy + 9 + l * 4); g.drawLine(cx + 4, iy + 9 + l * 4, cx + 11, iy + 9 + l * 4); }
+            }
             g.setPen(on ? cText : cWhite); f.setPointSize(8); g.setFont(f); g.drawText(QRect(r.x(), r.bottom() - 16, r.width(), 14), Qt::AlignCenter, names[i]); f.setPointSize(10); g.setFont(f);
         }
         y += 64;
@@ -1325,7 +1486,7 @@ private:
         nuzlockeBox(g, y);
         pageSoulLink(g, y, ps);
         y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
-        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y); else if (page == 3) pageBadges(g, y);
+        if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y); else if (page == 3) pageBadges(g, y); else if (page == 4) pageGuide(g, y);
         y += 8;
         if (y != contentHeight) { contentHeight = y; setMinimumHeight(y); }
     }
