@@ -1096,12 +1096,14 @@ private:
             if (v.secondsLeft <= 0 && v.phase < 2) v.phase = 3;
             return v;
         }
-        return v;   // HGTogether::inviteStatus() once Metagross' API is on main
+        HGTogether::InviteStatus st = HGTogether::inviteStatus();   // battle part (Metagross), thread-safe copy
+        v.role = st.role; v.phase = st.phase; v.trainer = st.trainer; v.peer = QString::fromStdString(st.peerName);
+        v.secondsLeft = st.secondsLeft; v.timeout = st.timeout; return v;
     }
     void answerInvite(bool yes)
     {
         if (getenv("HGT_DOCK_INVITE")) { fakePhase = yes ? (invite.role == 2 ? 2 : 1) : 3; return; }   // test hook: leader waits, joiner completes
-        // HGTogether::inviteAnswer(yes) once Metagross' API is on main
+        HGTogether::inviteAnswer(yes);
     }
     QString trainerLabel(uint32_t id) const { const GTrainer* t = findTrainer((int)id); return t ? QString("%1 %2").arg(t->cls, t->name) : QString("trainer #%1").arg(id); }
     // Big panel on top of the dock while an invite is open: question, Yes/No, countdown bar; afterwards briefly "2v2!" or "Solo".
