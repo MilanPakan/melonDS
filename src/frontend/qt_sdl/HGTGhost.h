@@ -19,6 +19,9 @@ struct Info { char name[8]; uint8_t gender; int16_t sprite; uint8_t frames; int3
 extern std::atomic<int> mySprite, myFrames;   // eigen keuze, gezet door het dock (applySprite)
 
 void init(const std::string& romPath);        // NARC a/0/8/1 uit het ROM-bestand (het dock patcht alleen de cart in het geheugen)
+// true = het bovenscherm is de overworld: FieldSystem bestaat en er draait geen kind-app (battle, tas, party-menu) op
+// processManager (FieldSystem+0 -> +4), dezelfde keten waarmee het battle-deel de BattleSetup vindt.
+bool overworld(melonDS::NDS& nds);
 void readInfo(melonDS::NDS& nds, Info& i);     // naam, geslacht en badges uit het spelersprofiel, sprite uit het dock
 // Ghost nr. idx tekenen: me/pos = wereldpositie (x,y,z fx32) van jezelf en van de peer; projectie via de spelcamera,
 // occlusie via de dieptebuffer van de software-renderer; frame = eigen frameteller (ren-cyclus).
