@@ -9,7 +9,7 @@
 // Bag-items in battle: de battle werkt op een kopie van de tas (BattleSetup+0x108) die na afloop wordt teruggeschreven
 // (pret battle_setup.c). De niet-Ball-pockets (items, medicine, berries, battle items) worden in die kopie leeggemaakt en na
 // de battle vanuit een snapshot in de echte tas teruggezet; Balls blijven zoals de battle ze achterliet. Geen ROM-patch.
-// shortcut: dupes op soort, niet op evolutiefamilie.
+// Dupes per evolutiefamilie (kFamily, uit de ROM gegenereerd met bench/families.py).
 #include "HGTNuzlocke.h"
 #include "EmuInstance.h"
 #include "NDS.h"
@@ -47,14 +47,17 @@ const uint32_t kFieldSysLiteral = 0x0203E304, kTaskWild = 0x02050C18, kTaskEncou
 const int kMapsecLeague = 15, kMapsecIndigo = 147;   // pret constants/map_sections.h: binnen de League vervalt de E4-cap
 enum { PENDING, CAUGHT, MISSED, REROLL };
 struct Enc { int32_t area; uint16_t species; uint32_t pid; uint8_t outcome; int64_t ts; };
-struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned; uint16_t party[6] = {}; uint8_t nParty = 0; };
-struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, starter; uint16_t party[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
-struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg, nicked; uint16_t hp; };
+struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg, nicked; uint16_t hp, maxhp; };
+// party-deel onzin (level 0 of > 100, HP > max): niets afdwingen, alleen melden (playtest 2026-10-21: party-deel onversleuteld weggeschreven)
+bool corrupt(const Mon& m) { return !m.egg && (m.level == 0 || m.level > 100 || m.maxhp == 0 || m.hp > m.maxhp); }
+struct Link { uint32_t pid, partner; int32_t area; uint8_t cause; };   // Soul Link: mijn pid moet weg; cause 0 = partner dood, 1 = partner gemist
+struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned; uint16_t party[6] = {}; uint8_t nParty = 0; uint32_t starter = 0; uint16_t starterSpecies = 0; std::vector<Link> linked; std::vector<Mon> corrupt; };
+struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, starter, soulLink; uint32_t starterPid; uint16_t starterSpecies; uint16_t party[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
 
 bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
 std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-thread) leest ze
-int myIdx = 0, starterFirst = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
-bool curEligible = false; uint32_t bagHidden = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
+int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
+bool curEligible = false; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
 bool inRam(uint32_t a) { return a >= 0x02000000 && a < 0x02400000; }
@@ -79,7 +82,7 @@ bool readMon(NDS& nds, uint32_t a, Mon& m, bool party = true)   // false = check
     memset(&m, 0, sizeof m); m.pid = pid; memcpy(&m.species, blocks + order[0] * 0x20, 2);
     uint32_t ivs; memcpy(&ivs, blocks + order[1] * 0x20 + 0x10, 4); m.egg = (ivs >> 30) & 1; m.nicked = ivs >> 31;   // blok B +0x10: bit 30 isEgg, bit 31 hasNickname
     if (!party) return true;
-    uint8_t pt[0x64]; memcpy(pt, raw + 0x88, 0x64); decrypt(pt, 0x64, pid); m.level = pt[4]; memcpy(&m.hp, pt + 6, 2);
+    uint8_t pt[0x64]; memcpy(pt, raw + 0x88, 0x64); decrypt(pt, 0x64, pid); m.level = pt[4]; memcpy(&m.hp, pt + 6, 2); memcpy(&m.maxhp, pt + 8, 2);
     return true;
 }
 uint32_t saveArray(NDS& nds, int idx) { return saveData + 0x10 + nds.ARM9Read32(saveData + 0x23014 + idx * 0x10 + 8); }
@@ -98,12 +101,43 @@ int levelCap()
 // --- regels ---
 Enc* findEnc(Player& p, int32_t area) { for (auto& e : p.encs) if (e.area == area) return &e; return nullptr; }
 bool has(const std::vector<uint32_t>& v, uint32_t x) { return std::find(v.begin(), v.end(), x) != v.end(); }
-bool owned(uint16_t species)
+// Evolutiefamilie per soort (basisvorm), gegenereerd met bench/families.py uit a/0/3/4 van Sacred Gold v1.05 (508 soorten).
+const uint16_t kFamily[508] = {
+    0,1,1,1,4,4,4,7,7,7,10,10,10,13,13,13,16,16,16,19,
+    19,21,21,23,23,172,172,27,27,29,29,29,32,32,32,173,173,37,37,174,
+    174,41,41,43,43,43,46,46,48,48,50,50,52,52,54,54,56,56,58,58,
+    60,60,60,63,63,63,66,66,66,69,69,69,72,72,74,74,74,77,77,79,
+    79,81,81,83,84,84,86,86,88,88,90,90,92,92,92,95,96,96,98,98,
+    100,100,102,102,104,104,236,236,108,109,109,111,111,440,114,115,116,116,118,118,
+    120,120,439,123,238,239,240,127,128,129,129,131,132,133,133,133,133,137,138,138,
+    140,140,142,446,144,145,146,147,147,147,150,151,152,152,152,155,155,155,158,158,
+    158,161,161,163,163,165,165,167,167,41,170,170,172,173,174,175,175,177,177,179,
+    179,179,43,298,298,438,60,187,187,187,190,191,191,193,194,194,133,133,198,79,
+    200,201,360,203,204,204,206,207,95,209,209,211,123,213,214,215,216,216,218,218,
+    220,220,222,223,223,225,458,227,228,228,116,231,231,137,234,235,236,236,238,239,
+    240,241,440,243,244,245,246,246,246,249,250,251,252,252,252,255,255,255,258,258,
+    258,261,261,263,263,265,265,265,265,265,270,270,270,273,273,273,276,276,278,278,
+    280,280,280,283,283,285,285,287,287,287,290,290,290,293,293,293,296,296,298,299,
+    300,300,302,303,304,304,304,307,307,309,309,311,312,313,314,406,316,316,318,318,
+    320,320,322,322,324,325,325,327,328,328,328,331,331,333,333,335,336,337,338,339,
+    339,341,341,343,343,345,345,347,347,349,349,351,352,353,353,355,355,357,433,359,
+    360,361,361,363,363,363,366,366,366,369,370,371,371,371,374,374,374,377,378,379,
+    380,381,382,383,384,385,386,387,387,387,390,390,390,393,393,393,396,396,396,399,
+    399,401,401,403,403,403,406,406,408,408,410,410,412,412,412,415,415,417,418,418,
+    420,420,422,422,190,425,425,427,427,200,198,431,431,433,434,434,436,436,438,439,
+    440,441,442,443,443,443,446,447,447,449,449,451,451,453,453,455,456,456,458,459,
+    459,215,81,108,111,114,239,240,175,193,133,133,207,220,137,280,299,355,361,479,
+    480,481,482,483,484,485,486,487,488,489,490,491,492,493,494,495,496,497,498,499,
+    500,501,502,503,504,505,506,507,
+};
+uint16_t family(uint16_t s) { return s < sizeof kFamily / sizeof *kFamily ? kFamily[s] : s; }
+bool owned(uint16_t species)   // dupe = een Pokémon uit dezelfde evolutiefamilie in een party of als vangst van een van beiden
 {
+    species = family(species);
     for (const Player* p : {&me, &peer})
     {
-        for (int i = 0; i < p->nParty; i++) if (p->party[i] == species) return true;
-        for (auto& e : p->encs) if (e.outcome == CAUGHT && e.species == species) return true;
+        for (int i = 0; i < p->nParty; i++) if (family(p->party[i]) == species) return true;
+        for (auto& e : p->encs) if (e.outcome == CAUGHT && family(e.species) == species) return true;
     }
     return false;
 }
@@ -121,6 +155,38 @@ int firstPicker(int32_t area)   // n-de ontdekte area (starter = nummer 0 van st
     return (n + 1 + starterFirst) % 2;
 }
 
+// --- Soul Link (docs/soullink.md): de eerste vangst per area van beide spelers is een paar, de starters ook (area -1).
+// Is de partner van de vriend dood, of heeft de vriend zijn encounter in die area gemist, dan moet mijn vangst ook weg. ---
+std::vector<Link> links(const Player& a, const Player& b)   // wat a kwijt moet door b
+{
+    std::vector<Link> out; if (!soulLink || soulLink != peerSoulLink) return out;
+    for (auto& e : a.encs)
+    {
+        if (e.outcome != CAUGHT || has(a.dead, e.pid)) continue;
+        for (auto& f : b.encs) if (f.area == e.area)
+        {
+            if (f.outcome == CAUGHT && has(b.dead, f.pid)) out.push_back({e.pid, f.pid, e.area, 0});
+            else if (f.outcome == MISSED) out.push_back({e.pid, 0, e.area, 1});
+        }
+    }
+    if (a.starter && b.starter && !has(a.dead, a.starter) && has(b.dead, b.starter)) out.push_back({a.starter, b.starter, -1, 0});
+    return out;
+}
+void updateLinks()
+{
+    std::vector<Link> mine = links(me, peer);
+    for (auto& l : mine)
+    {
+        bool known = false; for (auto& k : me.linked) known |= k.pid == l.pid;
+        if (!known) nzlog("SOUL LINK: area %d, partner %08X van de vriend is %s -> mijn pid %08X moet weg", l.area, l.partner, l.cause ? "gemist" : "dood", l.pid);
+    }
+    std::vector<Link> theirs = links(peer, me);   // ook de afleiding voor de vriend in de json (het dock toont die)
+    auto same = [](const std::vector<Link>& a, const std::vector<Link>& b) { if (a.size() != b.size()) return false; for (size_t i = 0; i < a.size(); i++) if (a[i].pid != b[i].pid || a[i].cause != b[i].cause) return false; return true; };
+    if (!same(mine, me.linked) || !same(theirs, peer.linked)) dirty = true;
+    me.linked = mine; peer.linked = theirs;
+}
+bool linked(uint32_t pid) { for (auto& l : me.linked) if (l.pid == pid) return true; return false; }
+
 // --- opslag + sync ---
 QJsonObject toJson(const Player& p)
 {
@@ -128,7 +194,11 @@ QJsonObject toJson(const Player& p)
     for (auto& e : p.encs) encs.append(QJsonObject{{"area", e.area}, {"species", e.species}, {"pid", (qint64)e.pid}, {"outcome", e.outcome}, {"ts", (qint64)e.ts}});
     for (auto d : p.dead) dead.append((qint64)d);
     for (auto b : p.banned) banned.append((qint64)b);
-    return {{"encs", encs}, {"dead", dead}, {"banned", banned}};
+    QJsonArray bad;   // party-Pokémon met onzin-waarden (alleen gemeld, niets afgedwongen)
+    for (auto& m : p.corrupt) bad.append(QJsonObject{{"pid", (qint64)m.pid}, {"species", m.species}, {"level", m.level}, {"hp", m.hp}, {"maxhp", m.maxhp}});
+    QJsonArray linked;   // afgeleid (Soul Link), voor het dock: area -1 = het starter-paar
+    for (auto& l : p.linked) linked.append(QJsonObject{{"pid", (qint64)l.pid}, {"partner", (qint64)l.partner}, {"area", l.area}, {"cause", l.cause ? "missed" : "dead"}});
+    return {{"encs", encs}, {"dead", dead}, {"banned", banned}, {"starter", (qint64)p.starter}, {"starterSpecies", p.starterSpecies}, {"linked", linked}, {"corrupt", bad}};
 }
 Player fromJson(const QJsonObject& o)
 {
@@ -136,12 +206,14 @@ Player fromJson(const QJsonObject& o)
     for (auto v : o["encs"].toArray()) { QJsonObject e = v.toObject(); p.encs.push_back({e["area"].toInt(), (uint16_t)e["species"].toInt(), (uint32_t)e["pid"].toDouble(), (uint8_t)e["outcome"].toInt(), (int64_t)e["ts"].toDouble()}); }
     for (auto v : o["dead"].toArray()) p.dead.push_back((uint32_t)v.toDouble());
     for (auto v : o["banned"].toArray()) p.banned.push_back((uint32_t)v.toDouble());
+    p.starter = (uint32_t)o["starter"].toDouble(); p.starterSpecies = (uint16_t)o["starterSpecies"].toInt();
     return p;
 }
 void save()
 {
     dirty = false; if (jsonPath.empty()) return;
-    QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}};   // starter = wie de starter als eerste koos (run-instelling)
+    QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}, {"soullink", soulLink != 0}};
+    if (me.starterSpecies && peer.starterSpecies) o["sameStarter"] = family(me.starterSpecies) == family(peer.starterSpecies);   // dock: "jullie hebben dezelfde starter"
     if (peerStarter >= 0) { o["peerStarter"] = peerStarter.load(); o["starterMismatch"] = peerStarter != starterFirst; }
     QFile f(QString::fromStdString(jsonPath)); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(o).toJson());
 }
@@ -150,13 +222,14 @@ void load()
     QFile f(QString::fromStdString(jsonPath)); if (!f.open(QIODevice::ReadOnly)) return;
     QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); me = fromJson(o["me"].toObject()); peer = fromJson(o["peer"].toObject());
     if (o.contains("starter")) starterFirst = o["starter"].toInt() ? 1 : 0;
+    if (o.contains("soullink")) soulLink = o["soullink"].toBool() ? 1 : 0;
 }
 void exchange()
 {
     if (sock < 0) return;
     if (peerLen && frame % 15 == 0)
     {
-        Packet p{}; memcpy(p.magic, "HGNZ", 4); p.idx = myIdx; p.starter = starterFirst;
+        Packet p{}; memcpy(p.magic, "HGNZ", 4); p.idx = myIdx; p.starter = starterFirst; p.soulLink = soulLink; p.starterPid = me.starter; p.starterSpecies = me.starterSpecies;
         p.nEncs = std::min<size_t>(me.encs.size(), 200); memcpy(p.encs, me.encs.data(), sizeof(Enc) * p.nEncs);
         p.nDead = std::min<size_t>(me.dead.size(), 64); memcpy(p.dead, me.dead.data(), 4 * p.nDead);
         p.nBanned = std::min<size_t>(me.banned.size(), 32); memcpy(p.banned, me.banned.data(), 4 * p.nBanned);
@@ -175,10 +248,15 @@ void exchange()
             if (p.starter != starterFirst) nzlog("BEURT-MISMATCH: ik heb HGT_NUZLOCKE_STARTER=%d, de vriend %d; beurtvolgorde en reroll-recht kloppen niet tot dit gelijk is", starterFirst, p.starter);
             else nzlog("beurtvolgorde gelijk met de vriend (starter %d)", starterFirst);
         }
-        Player q; q.encs.assign(p.encs, p.encs + p.nEncs); q.dead.assign(p.dead, p.dead + p.nDead); q.banned.assign(p.banned, p.banned + p.nBanned);
+        if (p.soulLink != peerSoulLink)
+        {
+            peerSoulLink = p.soulLink;
+            if (p.soulLink != soulLink) nzlog("SOULLINK-MISMATCH: ik heb HGT_SOULLINK=%d, de vriend %d; Soul Link geldt pas als het gelijk is", soulLink, p.soulLink);
+        }
+        Player q; q.starter = p.starterPid; q.starterSpecies = p.starterSpecies; q.encs.assign(p.encs, p.encs + p.nEncs); q.dead.assign(p.dead, p.dead + p.nDead); q.banned.assign(p.banned, p.banned + p.nBanned);
         q.nParty = p.nParty; memcpy(q.party, p.party, sizeof q.party);
-        if (q.encs.size() != peer.encs.size() || memcmp(q.encs.data(), peer.encs.data(), sizeof(Enc) * q.encs.size()) || q.dead != peer.dead || q.banned != peer.banned) dirty = true;
-        peer = q; if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; }
+        if (q.encs.size() != peer.encs.size() || memcmp(q.encs.data(), peer.encs.data(), sizeof(Enc) * q.encs.size()) || q.dead != peer.dead || q.banned != peer.banned || q.starter != peer.starter || q.starterSpecies != peer.starterSpecies) dirty = true;
+        q.linked = peer.linked; peer = q; if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; }
         fromLen = sizeof from;
     }
 }
@@ -196,6 +274,7 @@ void init(const std::string& rom)
         if (QFile::exists(QString::fromStdString(jsonPath)) && v != starterFirst) nzlog("let op: HGT_NUZLOCKE_STARTER=%d wijkt af van de opgeslagen run (%d); %d geldt", v, starterFirst, v);
         starterFirst = v;
     }
+    if (const char* e = getenv("HGT_SOULLINK")) soulLink = atoi(e) ? 1 : 0;
     mineStarter = starterFirst; save();   // bestand bestaat altijd vanaf de start
     const char* port = getenv("HGT_PORT"); const char* peerStr = getenv("HGT_PEER");
     if (!port) { nzlog("actief zonder HGT_PORT: geen sync"); return; }
@@ -217,22 +296,33 @@ void init(const std::string& rom)
         if (getaddrinfo(s.substr(0, colon).c_str(), std::to_string(atoi(s.substr(colon + 1).c_str()) + 200).c_str(), &hints, &res) != 0 || !res) return;
         memcpy(&peerAddr, res->ai_addr, res->ai_addrlen); peerLen = (socklen_t)res->ai_addrlen; freeaddrinfo(res);
     }
-    nzlog("actief als speler %d, poort %d, staat %s", myIdx, atoi(port) + 200, jsonPath.c_str());
+    nzlog("actief als speler %d, poort %d, staat %s, Soul Link %s", myIdx, atoi(port) + 200, jsonPath.c_str(), soulLink ? "aan" : "uit");
 }
 
 // --- bag: pockets items/medicine/berries/battle items (pret bag_types_def.h, 4 bytes per slot) ---
 const struct { uint32_t off, n; } kBlocked[] = {{0, 165}, {0x520, 40}, {0x5C0, 64}, {0x720, 30}};
+bool bagOk(NDS& nds) { return saveData && nds.ARM9Read32(saveData + 0x23014 + 3 * 0x10) == 3; }   // blok-header 3 = BAG
 void bagHide(NDS& nds, uint32_t setup)
 {
-    uint32_t copy = nds.ARM9Read32(setup + 0x108); if (!inRam(copy)) return;
-    if (!bagHeld) { uint32_t bag = saveArray(nds, 3); for (auto& p : kBlocked) for (uint32_t i = 0; i < p.n * 4; i++) bagSnap[p.off + i] = nds.ARM9Read8(bag + p.off + i); bagHeld = true; nzlog("tas: items verborgen voor de battle"); }
+    // alleen zolang de battle loopt (winFlag 0) en alleen in de tas-kopie die we bij het begin van deze battle zagen: geen
+    // schrijfacties in geheugen dat na de battle al vrijgegeven en hergebruikt kan zijn
+    uint32_t copy = nds.ARM9Read32(setup + 0x108); if (!inRam(copy) || nds.ARM9Read32(setup + 0x14) != 0) return;
+    if (setup != bagHidden) bagCopy = copy; else if (copy != bagCopy) return;
+    if (!bagHeld)
+    {
+        if (!bagOk(nds)) { nzlog("tas: SaveData klopt niet (blok 3), tas niet aangeraakt"); return; }
+        uint32_t bag = saveArray(nds, 3); for (auto& p : kBlocked) for (uint32_t i = 0; i < p.n * 4; i++) bagSnap[p.off + i] = nds.ARM9Read8(bag + p.off + i);
+        bagHeld = true; bagSnapSD = saveData; nzlog("tas: items verborgen voor de battle");
+    }
     for (auto& p : kBlocked) for (uint32_t i = 0; i < p.n * 4; i++) if (nds.ARM9Read8(copy + p.off + i)) nds.ARM9Write8(copy + p.off + i, 0);
     bagHidden = setup;
 }
-void bagRestore(NDS& nds)
+void bagRestore(NDS& nds)   // aanroep alleen in de overworld: saveData is dan net uit het FieldSystem gelezen
 {
+    bagHeld = false; bagHidden = bagCopy = 0;
+    if (!bagOk(nds) || saveData != bagSnapSD) { nzlog("tas: SaveData anders dan bij het verbergen (%08X, was %08X) of blok 3 klopt niet: items NIET teruggezet", saveData, bagSnapSD); return; }
     uint32_t bag = saveArray(nds, 3); for (auto& p : kBlocked) for (uint32_t i = 0; i < p.n * 4; i++) nds.ARM9Write8(bag + p.off + i, bagSnap[p.off + i]);
-    bagHeld = false; bagHidden = 0; nzlog("tas: items terug");
+    nzlog("tas: items terug");
 }
 
 // --- encounter-watcher: taakketen FS+0x10 -> prev; Task_WildEncounter/Task_StartEncounter hebben env+0x10 = BattleSetup ---
@@ -262,7 +352,7 @@ void watchBattleParty(NDS& nds, uint32_t setup)
     for (uint32_t i = 0; i < cur; i++)
     {
         Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
-        if (m.species && m.hp == 0 && !m.egg && !has(me.dead, m.pid)) { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+        if (m.species && m.hp == 0 && !m.egg && !corrupt(m) && !has(me.dead, m.pid)) { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
     }
 }
 void watchEncounter(NDS& nds, uint32_t fs)
@@ -294,6 +384,8 @@ void watchEncounter(NDS& nds, uint32_t fs)
 // --- party: doden markeren, afdwingen in de overworld (dood / verboden / boven de cap -> eerste lege pc-box) ---
 bool box(NDS& nds, uint32_t party, uint32_t cur, int slot)
 {
+    // alleen records verplaatsen die het spel nu niet ontsleuteld heeft (+4 vlaggen partyDecrypted/boxDecrypted/checksumFailed = 0)
+    for (uint32_t k = slot; k < cur; k++) if (nds.ARM9Read16(party + 8 + k * 0xEC + 4)) { nzlog("box: slot %u is nu ontsleuteld in gebruik, later opnieuw", k); return false; }
     uint32_t storage = saveArray(nds, 41), curBox = nds.ARM9Read32(storage + 0x12000); if (curBox >= 18) curBox = 0;
     for (uint32_t b = 0; b < 18; b++) for (int s = 0; s < 30; s++)
     {
@@ -322,18 +414,31 @@ void watchParty(NDS& nds, uint32_t fs, bool idle)
     Mon mons[6];
     for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, mons[i])) return;   // half geschreven: volgende keer
     me.nParty = cur; for (uint32_t i = 0; i < cur; i++) me.party[i] = mons[i].species;
+    if (!me.starter && me.encs.empty() && cur == 1 && !mons[0].egg) { me.starter = mons[0].pid; me.starterSpecies = mons[0].species; dirty = true; nzlog("starter: soort %u pid %08X (Soul Link-paar met de starter van de vriend)", mons[0].species, mons[0].pid); }
+    std::vector<Mon> bad; for (uint32_t i = 0; i < cur; i++) if (corrupt(mons[i])) bad.push_back(mons[i]);
+    for (auto& m : bad)
+    {
+        bool known = false; for (auto& k : me.corrupt) known |= k.pid == m.pid;
+        if (!known) nzlog("FOUT: party-gegevens van soort %u pid %08X zijn onzin (Lv %u, HP %u/%u); niets afgedwongen. Herstel: in de pc zetten en weer ophalen", m.species, m.pid, m.level, m.hp, m.maxhp);
+    }
+    if (bad.size() != me.corrupt.size()) dirty = true;
+    me.corrupt = bad;
+    static bool sameWarned = false;
+    if (!sameWarned && me.starterSpecies && peer.starterSpecies && family(me.starterSpecies) == family(peer.starterSpecies))
+    { sameWarned = true; nzlog("ZELFDE STARTER: jij en de vriend hebben allebei soort %u (familie %u); starters vallen buiten de dupes-regel, er wordt niets geboxt", me.starterSpecies, family(me.starterSpecies)); }
     static std::vector<uint32_t> nickWarned;   // verplichte nickname: één melding per Pokémon per sessie (naam geven: Name Rater, Goldenrod)
     for (uint32_t i = 0; i < cur; i++)
         if (!mons[i].egg && !mons[i].nicked && !has(nickWarned, mons[i].pid)) { nickWarned.push_back(mons[i].pid); nzlog("NICKNAME VERPLICHT: soort %u pid %08X heeft geen bijnaam", mons[i].species, mons[i].pid); }
     for (uint32_t i = 0; i < cur; i++)
-        if (mons[i].hp == 0 && !mons[i].egg && !has(me.dead, mons[i].pid)) { me.dead.push_back(mons[i].pid); dirty = true; nzlog("DOOD: soort %u Lv%u pid %08X", mons[i].species, mons[i].level, mons[i].pid); }
+        if (mons[i].hp == 0 && !mons[i].egg && !corrupt(mons[i]) && !has(me.dead, mons[i].pid)) { me.dead.push_back(mons[i].pid); dirty = true; nzlog("DOOD: soort %u Lv%u pid %08X", mons[i].species, mons[i].level, mons[i].pid); }
     if (!idle) return;
     uint32_t loc = nds.ARM9Read32(fs + 0x20); int32_t mapId = inRam(loc) ? (int32_t)nds.ARM9Read32(loc) : -1;
     int mapsec = mapId >= 0 && mapId < 540 ? nds.ARM9Read8(kMapHeaders + mapId * 0x18 + 18) : -1;
     int cap = levelCap(); bool league = cap == 55 && (mapsec == kMapsecLeague || mapsec == kMapsecIndigo);
     for (uint32_t i = 0; i < cur; i++)
     {
-        const char* why = has(me.dead, mons[i].pid) ? "dood" : has(me.banned, mons[i].pid) ? "verboden vangst" : (!league && !mons[i].egg && mons[i].level > cap) ? "boven de level cap" : nullptr;
+        if (corrupt(mons[i])) continue;   // gemeld hierboven; een bug mag geen run beëindigen
+        const char* why = has(me.dead, mons[i].pid) ? "dood" : has(me.banned, mons[i].pid) ? "verboden vangst" : linked(mons[i].pid) ? "Soul Link-partner weg" : (!league && !mons[i].egg && mons[i].level > cap) ? "boven de level cap" : nullptr;
         if (!why) continue;
         if (cur == 1) { if (frame % 600 == 0) nzlog("laatste Pokémon is %s: run voorbij", why); return; }
         nzlog("soort %u Lv%u pid %08X %s (cap %d)", mons[i].species, mons[i].level, mons[i].pid, why, cap);
@@ -357,9 +462,9 @@ void HGTNuzlocke::tick(EmuInstance* emu)
         johto = nds.ARM9Read8(pd + 4 + 0x1A); kanto = nds.ARM9Read8(pd + 4 + 0x1F); gameClear = nds.ARM9Read8(pd + 4 + 0x1D) & 1;
         if (fs) fieldSys = fs;
         watchEncounter(nds, fieldSys);   // de taakketen leeft in het FieldSystem, ook als de pointer tijdens de battle NULL is
-        bool idle = fs && nds.ARM9Read32(fs + 0x10) == 0 && nds.ARM9Read32(fs + 0x6C) == 1 && !curSetup;
+        bool idle = fs && nds.ARM9Read32(fs + 0x10) == 0 && nds.ARM9Read32(fs + 0x6C) == 1 && !curSetup && inRam(nds.ARM9Read32(fs)) && nds.ARM9Read32(nds.ARM9Read32(fs) + 8) == 0;   // + [[FS]+8] isPaused == 0 (geen menu/app open)
         if (idle && bagHeld) bagRestore(nds);   // na de terugschrijf van de battle-tas
-        if (frame % 8 == 0) watchParty(nds, fs, idle);
+        if (frame % 8 == 0) { updateLinks(); watchParty(nds, fs, idle); }
     }
     exchange();
     if (dirty && frame % 15 == 0) save();
