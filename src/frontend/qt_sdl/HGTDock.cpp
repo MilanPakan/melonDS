@@ -7,6 +7,7 @@
 #include "EmuInstance.h"
 #include "NDS.h"
 #include "HGTGhost.h"
+#include "HGTogether.h"
 #include <QPainter>
 #include <QMouseEvent>
 #include <QTimer>
@@ -743,7 +744,7 @@ public:
     HGTPanel(EmuInstance* emu, std::function<QString()> romPath) : emu(emu), romPath(std::move(romPath))
     {
         setMinimumWidth(370);
-        int port = atoi(getenv("HGT_PORT") ? getenv("HGT_PORT") : "0");
+        port = atoi(getenv("HGT_PORT") ? getenv("HGT_PORT") : "0"); instance = atoi(getenv("HGT_INSTANCE") ? getenv("HGT_INSTANCE") : "0");
         if (const char* peer = getenv("HGT_PEER")) { QStringList p = QString(peer).split(':'); if (p.size() == 2) { peerHost = QHostAddress(p[0]); peerPort = p[1].toInt() + 100; } }
         if (port) sock.bind(QHostAddress::AnyIPv4, port + 100);   // +1 would collide with the peer's ghost port when ports are consecutive
         QObject::connect(&sock, &QUdpSocket::readyRead, [this] { receive(); });
@@ -754,7 +755,7 @@ public:
     }
 
 private:
-    EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0;
+    EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0, port = 0, instance = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
     Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
@@ -1094,14 +1095,23 @@ private:
     {
         QPainter g(this); g.fillRect(rect(), cBg); QFont f = g.font(); f.setPointSize(10); g.setFont(f);
         int W = width(), y = 0; auto ps = pairs();
-        qint64 since = peerSeen ? (QDateTime::currentMSecsSinceEpoch() - peerSeen) / 1000 : -1; bool online = since >= 0 && since < 3;
-        QString status = online ? QString(QChar(0x25cf)) + " connected" : since < 0 ? QString(QChar(0x25cb)) + " waiting for friend" : QString(QChar(0x25cb)) + QString(" no signal %1s").arg(since);
         header(g, y, "HG TOGETHER");
-        g.setPen(online ? cGreen : cYellow); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, status);
+        g.setPen(cSlot); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, QString("port %1 %2 instance %3").arg(port).arg(QChar(0x00b7)).arg(instance));
         Boss cap = levelCap(johto, kanto, gameClear); int badges = __builtin_popcount(johto) + __builtin_popcount(kanto);
         g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 20); g.setPen(cText);
         g.drawText(QRect(16, y, W - 32, 20), Qt::AlignVCenter, QString("%1 %2 %3  %4  Cap %5 (%6)  %4  %7/16 badges").arg(myName, QChar(0x2194), peerName, QChar(0x00b7)).arg(cap.cap).arg(cap.name).arg(badges));
         y += 26;
+        // connection status per peer from the ghost bridge (HGTogether.cpp): name, sprite, seconds since the last position packet
+        auto peers = HGTogether::peerStatus();
+        if (peers.empty()) { g.setPen(cYellow); g.drawText(QRect(16, y, W - 32, 18), Qt::AlignVCenter, QString(QChar(0x25cb)) + " waiting for friend"); y += 20; }
+        for (auto& p : peers)
+        {
+            const SpriteDef* d = spriteDef(p.sprite); QString spr = p.sprite < 0 ? (p.gender ? "Heroine" : "Hero") : d ? d->name : QString::number(p.sprite);
+            g.setPen(p.connected ? cGreen : cYellow);
+            g.drawText(QRect(16, y, W - 32, 18), Qt::AlignVCenter, QString("%1 %2 (%3)  %4").arg(QChar(p.connected ? 0x25cf : 0x25cb)).arg(QString::fromStdString(p.name), spr)
+                       .arg(p.connected ? QString("%1s ago").arg(p.since, 0, 'f', 1) : QString("no signal %1s").arg((int)p.since)));
+            y += 20;
+        }
         pageSoulLink(g, y, ps);
         y += 4; tabBar(g, y, ps);   // tool bar under the pairs, the open tool below it (Soul Link always on top)
         if (page == 1) pageGraveyard(g, y, ps); else if (page == 2) pageSprite(g, y);

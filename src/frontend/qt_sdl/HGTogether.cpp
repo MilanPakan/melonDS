@@ -227,6 +227,15 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
     return true;
 }
 
+std::vector<HGTogether::PeerStatus> HGTogether::peerStatus()
+{
+    // shortcut: geen lock; peers groeit alleen bij een nieuwe peer en het dock leest hooguit 4x per seconde; lock zodra het gaat kraken
+    std::vector<PeerStatus> v;
+    for (const Peer& p : peers)
+        v.push_back({ std::string(p.st.info.name, strnlen(p.st.info.name, 8)), p.st.info.gender, p.st.info.sprite, p.st.info.frames, (frame - p.seen) / 60.0f, frame - p.seen < kPeerTimeout });
+    return v;
+}
+
 bool HGTogether::input(EmuInstance* emu)
 {
     if (ctlFd == -2 || !emu->nds) return false;
