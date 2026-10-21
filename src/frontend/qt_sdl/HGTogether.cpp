@@ -48,6 +48,15 @@ State me{}, peer{}; bool havePeer = false;
 struct BattleMsg { char tag[4]; uint32_t trainer; };
 const uint32_t kSignal = 0x02078B04;
 BattleMsg peerBattle{}; uint32_t peerBattleSeen = 0, lastJoin = 0;
+// Is de hook er echt (scriptcommando 213 -> onze TB-cave)? Zonder hook (ongepatchte ROM/andere states) staat op kSignal
+// gewone code: die niet als sein lezen en ook geen joiner-script injecteren (9019 bestaat dan niet).
+const uint32_t kCmd213 = 0x020FB054, kCaveLo = 0x02078834, kCaveHi = 0x02078B00;
+// club-struct van overlay 3 (pointer op 0x022598A0, alleen gezet zolang de club-UI draait); +0x88 = retCode, 2 = verbonden
+bool clubConnected(NDS& nds) { uint32_t c = nds.ARM9Read32(0x022598A0); return c >= 0x02000000 && c < 0x02400000 && nds.ARM9Read32(c + 0x88) == 2; }
+bool hookOn(NDS& nds) { uint32_t tb = nds.ARM9Read32(kCmd213); return tb > kCaveLo && tb < kCaveHi; }
+// Club-UI automatisch: na het sein (leader) of de injectie (joiner) elke 40 frames A, tot de club verbonden is,
+// maximaal kClubFrames.
+const uint32_t kClubFrames = 1500; int clubRole = 0; uint32_t clubUntil = 0; u32 autoKeyFrames = 0;
 uint32_t frame = 0, peerSeen = 0;
 std::string dumpDir;
 
@@ -228,9 +237,11 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
 
 bool HGTogether::input(EmuInstance* emu)
 {
-    if (ctlFd == -2 || !emu->nds) return false;
+    if (!emu->nds) return false;
     if (ctlFd == -1) { const char* p = getenv("HGT_CTL"); ctlFd = (p && *p) ? open(p, O_RDONLY | O_NONBLOCK) : -2; if (p && *p) fprintf(stderr, "HGT: ctl %s %s\n", p, ctlFd >= 0 ? "open" : "MISLUKT"); }
-    return ctlStep(*emu->nds);
+    if (ctlStep(*emu->nds)) return true;   // ook zonder HGT_CTL: ctlStep handelt dan de mailbox-calls af (joiner-injectie)
+    if (!autoKeyFrames) return false;
+    autoKeyFrames--; emu->nds->SetKeyMask(0xFFF & ~1u); emu->nds->ReleaseScreen(); return true;   // club-A (zie clubRole)
 }
 
 // HGT_POKES="020514B8=0FE0;0223E6D2=A9>A8": bytes in RAM overschrijven (ROM-code patchen voor fase 4-experimenten).
@@ -323,14 +334,16 @@ void HGTogether::tick(EmuInstance* emu)
     NDS& nds = *emu->nds;
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
     if (frame % 30 == 0) logBattle(nds);
-    uint32_t t = frame > 300 ? nds.ARM9Read32(kSignal) : 0;   // pas na de pokes (frame 240+), anders lezen we Wi-Fi-code
+    bool hook = frame > 300 && hookOn(nds);   // pas na de pokes (frame 240+) en alleen als de TB-hook echt in RAM staat
+    uint32_t t = hook ? nds.ARM9Read32(kSignal) : 0;
     if (t)   // ROM-hook: trainerbattle gestart, ander moet joinen
     {
         BattleMsg m{ {'H','G','T','B'}, t }; nds.ARM9Write32(kSignal, 0);
         for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen);
         fprintf(stderr, "HGT: trainerbattle %u -> sein naar de ander\n", t);
+        clubRole = 1; clubUntil = frame + kClubFrames;
     }
-    if (peerBattleSeen && frame - peerBattleSeen < 2 && frame - lastJoin > 600 && !call.active && !call.pending)
+    if (hook && peerBattleSeen && frame - peerBattleSeen < 2 && frame - lastJoin > 600 && !call.active && !call.pending)
     {
         uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0;
         if (inRam(fs))
@@ -339,7 +352,14 @@ void HGTogether::tick(EmuInstance* emu)
             nds.ARM9Write32(kSignal - 4, peerBattle.trainer); nds.ARM9Write32(kSignal + 12, peerBattle.trainer);   // HGT.trainer/trainer2: zelfde vijand op beide kanten
             call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = js ? atoi(js) : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true; lastJoin = frame;
             fprintf(stderr, "HGT: ander start trainerbattle %u -> joiner-script %u\n", peerBattle.trainer, call.a[1]);
+            clubRole = 2; clubUntil = frame + kClubFrames;
         }
+    }
+    if (clubRole)
+    {
+        bool joined = clubConnected(nds) || (clubRole == 1 && nds.ARM9Read32(kSignal + 8) != 0);
+        if (joined || frame >= clubUntil) { fprintf(stderr, "HGT: club %s %s\n", clubRole == 1 ? "leader" : "joiner", joined ? "verbonden" : "TIME-OUT"); clubRole = 0; }
+        else if (frame % 40 == 0) autoKeyFrames = 4;   // A (JOIN THIS GROUP / YES); op "Awaiting contact" doet A niets
     }
     bool haveMe = readState(nds, me); me.frame = frame;
     if (haveMe) exchange();
