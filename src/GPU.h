@@ -861,6 +861,7 @@ public:
     // if the renderer uses RAM buffers, they should be 32-bit BGRA, 256x192 for each screen
     virtual bool GetFramebuffers(void** top, void** bottom) = 0;
     virtual void SwapBuffers() { BackBuffer ^= 1; }
+    Renderer3D& Get3DRenderer() { return *Rend3D; }   // HG-Together: dieptebuffer voor de ghost-occlusie
 
     virtual bool NeedsShaderCompile() { return false; }
     virtual void ShaderCompileStep(int& current, int& count) {}

@@ -14,14 +14,15 @@ namespace melonDS { class NDS; }
 namespace HGTGhost
 {
 #pragma pack(push, 1)
-struct Info { char name[8]; uint8_t gender; int16_t sprite; uint8_t frames; };   // sprite = mmodel (-1 = Ethan/Lyra naar geslacht), frames = 12 (NPC) of 24
+struct Info { char name[8]; uint8_t gender; int16_t sprite; uint8_t frames; int32_t py; };   // sprite = mmodel (-1 = Ethan/Lyra naar geslacht), frames = 12 (NPC) of 24; py = hoogte (fx32)
 #pragma pack(pop)
 extern std::atomic<int> mySprite, myFrames;   // eigen keuze, gezet door het dock (applySprite)
 
 void init(const std::string& romPath);        // NARC a/0/8/1 uit het ROM-bestand (het dock patcht alleen de cart in het geheugen)
 void readInfo(melonDS::NDS& nds, Info& i);     // naam + geslacht uit het spelersprofiel, sprite uit het dock
-// Ghost op (dx,dy) px t.o.v. de eigen speler; px/pz = fx32-positie van de peer (loopfase), frame = eigen frameteller (ren-cyclus).
-void draw(melonDS::u32* fb, int dx, int dy, int facing, int32_t px, int32_t pz, uint32_t frame, const Info& peer);
+// Ghost nr. idx tekenen: me/pos = wereldpositie (x,y,z fx32) van jezelf en van de peer; projectie via de spelcamera,
+// occlusie via de dieptebuffer van de software-renderer; frame = eigen frameteller (ren-cyclus).
+void draw(melonDS::u32* fb, melonDS::NDS& nds, int idx, const int32_t me[3], const int32_t pos[3], int facing, uint32_t frame, const Info& peer);
 
 inline char dsChar(uint16_t c)   // HGSS charmap: digits 0x121, A 0x12B, a 0x145, space 0x1DE
 {
