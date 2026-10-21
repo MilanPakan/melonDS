@@ -22,6 +22,7 @@
 #include <QFileInfo>
 #include <QCoreApplication>
 #include <set>
+#include <tuple>
 #include <QHostAddress>
 #include <QDateTime>
 #include <QJsonObject>
@@ -847,6 +848,11 @@ private:
     std::map<int, GMap> guide; std::vector<GBoss> bosses; bool guideTried = false; QString guidePath;
     std::set<int> beaten; int guideTrainer = -1; bool wildOpen = false;   // guideTrainer: open team view (-1 = list)
     std::vector<std::pair<QRect, int>> trainerRects; QRect backRect, wildRect;
+    // Co-op invite (trainer battle): mirror of HGTogether::InviteStatus (Metagross, battle part). role 0 none / 1 I start (leader) /
+    // 2 the friend starts (joiner); phase 0 ask me / 1 I said yes, waiting / 2 both yes: 2v2 / 3 solo. HGT_DOCK_INVITE="role:phase:trainer:s"
+    // fakes one for headless tests (counts down locally; clicks change the phase as the real API would).
+    struct Invite { int role = 0, phase = 0; uint32_t trainer = 0; QString peer; float secondsLeft = 0, timeout = 15; };
+    Invite invite; qint64 fakeInviteStart = 0; int fakePhase = -1; QRect yesRect, noRect;
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite, 3 Badges; Soul Link is always shown
     Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
@@ -1078,6 +1084,66 @@ private:
         }
     }
 
+    Invite readInvite()
+    {
+        Invite v;
+        if (const char* e = getenv("HGT_DOCK_INVITE"))   // test hook
+        {
+            QStringList p = QString(e).split(':'); if (p.size() < 4) return v;
+            if (!fakeInviteStart) fakeInviteStart = QDateTime::currentMSecsSinceEpoch();
+            v.role = p[0].toInt(); v.phase = fakePhase >= 0 ? fakePhase : p[1].toInt(); v.trainer = p[2].toUInt(); v.timeout = p[3].toFloat();
+            v.peer = peerName; v.secondsLeft = std::max(0.0f, v.timeout - (QDateTime::currentMSecsSinceEpoch() - fakeInviteStart) / 1000.0f);
+            if (v.secondsLeft <= 0 && v.phase < 2) v.phase = 3;
+            return v;
+        }
+        return v;   // HGTogether::inviteStatus() once Metagross' API is on main
+    }
+    void answerInvite(bool yes)
+    {
+        if (getenv("HGT_DOCK_INVITE")) { fakePhase = yes ? (invite.role == 2 ? 2 : 1) : 3; return; }   // test hook: leader waits, joiner completes
+        // HGTogether::inviteAnswer(yes) once Metagross' API is on main
+    }
+    QString trainerLabel(uint32_t id) const { const GTrainer* t = findTrainer((int)id); return t ? QString("%1 %2").arg(t->cls, t->name) : QString("trainer #%1").arg(id); }
+    // Big panel on top of the dock while an invite is open: question, Yes/No, countdown bar; afterwards briefly "2v2!" or "Solo".
+    void invitePanel(QPainter& g, int& y)
+    {
+        yesRect = noRect = QRect(); if (!invite.role) return;
+        int W = width(); QFont f = g.font(); QString who = trainerLabel(invite.trainer);
+        QRect box(6, y + 6, W - 12, invite.phase == 0 ? 132 : 84);
+        QColor border = invite.phase == 2 ? cGreen : invite.phase == 3 ? cMuted : cGold;
+        g.setPen(QPen(border, 4)); g.setBrush(cSlot); g.drawRoundedRect(box, 10, 10);
+        QString title = invite.phase == 2 ? QString("2v2! Together against %1").arg(who)
+                      : invite.phase == 3 ? QString("Solo battle against %1").arg(who)
+                      : invite.phase == 1 ? QString("Waiting for %1…").arg(invite.peer)
+                      : invite.role == 1 ? QString("Fight %1 together?").arg(who)
+                                         : QString("%1 starts a battle against %2. Join?").arg(invite.peer, who);
+        g.setPen(cText); f.setPointSize(13); f.setBold(true); g.setFont(f);
+        g.drawText(QRect(box.x() + 12, box.y() + 8, box.width() - 24, 44), Qt::AlignCenter | Qt::TextWordWrap, title);
+        f.setPointSize(10); f.setBold(false); g.setFont(f);
+        int by = box.y() + 56;
+        if (invite.phase == 0)
+        {
+            int bw = (box.width() - 36) / 2;
+            yesRect = QRect(box.x() + 12, by, bw, 40); noRect = QRect(yesRect.right() + 12, by, bw, 40);
+            for (auto [r, c, t] : {std::tuple{yesRect, cGreen, "Yes"}, std::tuple{noRect, cRed, "No"}})
+            {
+                g.setPen(QPen(c.darker(130), 2)); g.setBrush(c); g.drawRoundedRect(r, 8, 8);
+                g.setPen(cWhite); f.setPointSize(14); f.setBold(true); g.setFont(f); g.drawText(r, Qt::AlignCenter, t); f.setPointSize(10); f.setBold(false); g.setFont(f);
+            }
+            by += 48;
+        }
+        if (invite.phase < 2)   // countdown bar
+        {
+            QRect bar(box.x() + 12, by, box.width() - 24, 12); float k = invite.timeout > 0 ? invite.secondsLeft / invite.timeout : 0;
+            g.setPen(Qt::NoPen); g.setBrush(cSlotDead); g.drawRoundedRect(bar, 6, 6);
+            g.setBrush(k > 0.33f ? cGold : cRed); g.drawRoundedRect(QRect(bar.x(), bar.y(), (int)(bar.width() * k), bar.height()), 6, 6);
+            g.setPen(cMuted); f.setPointSize(8); g.setFont(f);
+            g.drawText(QRect(bar.x(), bar.bottom() + 1, bar.width(), 12), Qt::AlignRight, QString("%1 s, then solo").arg((int)ceil(invite.secondsLeft)));
+            f.setPointSize(10); g.setFont(f);
+        }
+        y = box.bottom() + 8;
+    }
+
     void loadNuzlocke()
     {
         QString rom = romPath(); QFile f(rom + ".nuzlocke.json"); nzOn = !rom.isEmpty() && f.open(QIODevice::ReadOnly); if (!nzOn) return;
@@ -1171,6 +1237,7 @@ private:
         // headless test of the runtime path: HGT_DOCK_TOGGLE=<s> flips both view switches once after <s> seconds (as a click would)
         if (const char* t = getenv("HGT_DOCK_TOGGLE")) if (nzTicks == atoi(t) * 4) { viewDiorama = !viewDiorama; viewSharp = !viewSharp; saveView(); applyView(); }
         applySprite(*nds);
+        invite = readInvite();
         send(); update();
         if (const char* d = getenv("HGT_DOCK_DUMP")) if (++ticks % 8 == 0) grab().save(d);   // headless test: PNG of the dock every 2 s
         // camera test (emulator/test-cam.sh): the game area as the X server shows it, so it also works with the OpenGL renderer
@@ -1215,6 +1282,7 @@ private:
 
     void mousePressEvent(QMouseEvent* e) override
     {
+        if (yesRect.contains(e->pos()) || noRect.contains(e->pos())) { answerInvite(yesRect.contains(e->pos())); update(); return; }
         if (dioramaRect.contains(e->pos()) && !HGTCamera::envSet()) { viewDiorama = !viewDiorama; saveView(); applyView(); update(); return; }
         if (sharpRect.contains(e->pos())) { viewSharp = !viewSharp; saveView(); applyView(); update(); return; }
         for (int i = 0; i < (int)tabRects.size(); i++) if (tabRects[i].contains(e->pos())) { page = page == i + 1 ? 0 : i + 1; update(); return; }   // click again = close
@@ -1471,6 +1539,7 @@ private:
     {
         QPainter g(this); g.fillRect(rect(), cBg); QFont f = g.font(); f.setPointSize(10); g.setFont(f);
         int W = width(), y = 0; auto ps = pairs();
+        invitePanel(g, y);
         header(g, y, "HG TOGETHER");
         g.setPen(cSlot); g.drawText(QRect(0, y - 26, W - 8, 22), Qt::AlignRight | Qt::AlignVCenter, QString("port %1 %2 instance %3").arg(port).arg(QChar(0x00b7)).arg(instance));
         Boss cap = levelCap(johto, kanto, gameClear); int badges = __builtin_popcount(johto) + __builtin_popcount(kanto);
