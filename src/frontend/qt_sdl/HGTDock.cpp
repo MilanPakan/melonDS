@@ -1063,7 +1063,9 @@ private:
         if (!wildOpen) return;
         for (auto& [key, list] : m.wild)
         {
-            g.setPen(cWhite); f.setPointSize(9); g.setFont(f); g.drawText(QRect(12, y, W - 24, 16), Qt::AlignVCenter, key.at(0).toUpper() + key.mid(1)); y += 16;
+            g.setPen(cWhite); f.setPointSize(9); g.setFont(f); static const std::map<QString, QString> kWildLabel = {{"morning", "Morning"}, {"day", "Day"}, {"night", "Night"}, {"surf", "Surf"},
+                {"rocksmash", "Rock Smash"}, {"oldrod", "Old Rod"}, {"goodrod", "Good Rod"}, {"superrod", "Super Rod"}};
+            g.drawText(QRect(12, y, W - 24, 16), Qt::AlignVCenter, kWildLabel.count(key) ? kWildLabel.at(key) : key); y += 16;
             int cw = (W - 16) / 4;
             for (size_t i = 0; i < list.size(); i++)
             {
@@ -1363,7 +1365,7 @@ private:
         if (std::none_of(peers.begin(), peers.end(), [](auto& p) { return p.connected; })) acts << QString("▶ %1 not connected.").arg(peers.empty() ? QString("Friend") : QString::fromStdString(peers[0].name));
         // Nuzlocke rule (HGTNuzlocke logs "NICKNAME VERPLICHT"): every Pokémon in the party needs a nickname; without one the name
         // field holds the species name, so that is what we show. Name Rater: Goldenrod City.
-        if (nzOn) for (int i = 0; i < nMons; i++) if (!mons[i].egg && !nicked[i]) acts << QString("▶ Give %1 a nickname (Name Rater, Goldenrod).").arg(QString::fromLatin1(mons[i].nick));
+        if (nzOn) for (int i = 0; i < nMons; i++) if (!mons[i].egg && !nicked[i]) acts << QString("▶ Give %1 a nickname (Name Rater).").arg(QString::fromLatin1(mons[i].nick));
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
         for (auto& a : acts) { int h = g.fontMetrics().boundingRect(QRect(0, 0, tw, 1000), Qt::TextWordWrap, a).height() + 4; hs << h; ah += h; }
