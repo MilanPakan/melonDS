@@ -835,6 +835,9 @@ private:
     // outcome 0 pending/1 caught/2 missed/3 reroll, ts}], dead:[pid], banned:[pid]}}). Missing file = Nuzlocke off.
     struct NzEnc { int area, outcome; qint64 ts; };
     int nzTicks = 0; bool nzOn = false; std::vector<NzEnc> nzEnc[2]; std::vector<uint32_t> nzDead[2]; int mapsec = -1;
+    // Kyogre round 3: Soul Link partners that must go (area -1 = starter pair), corrupt party entries (only reported), switches.
+    struct NzLink { uint32_t pid, partner; int area; bool missed; }; struct NzBad { uint32_t pid; int species, level, hp, maxhp; };
+    std::vector<NzLink> nzLinked[2]; std::vector<NzBad> nzCorrupt; int nzSoulLink = -1, nzSameStarter = -1;
     // View switch (docs/camera.md): diorama camera (HGT_CAM 30,45,1 unless HGT_CAM is set) and sharp view (OpenGL renderer at 4x).
     // Stored next to the ROM in <rom>.view as "diorama sharp" (0/1 each), applied at start; the launcher has no setting for it.
     bool viewDiorama = false, viewSharp = false; QRect dioramaRect, sharpRect;
@@ -1150,11 +1153,15 @@ private:
     {
         QString rom = romPath(); QFile f(rom + ".nuzlocke.json"); nzOn = !rom.isEmpty() && f.open(QIODevice::ReadOnly); if (!nzOn) return;
         QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); const char* keys[2] = {"me", "peer"};
+        nzSoulLink = o.contains("soullink") ? o["soullink"].toBool() : -1; nzSameStarter = o.contains("sameStarter") ? o["sameStarter"].toBool() : -1;
         for (int w = 0; w < 2; w++)
         {
             QJsonObject p = o[keys[w]].toObject(); nzEnc[w].clear(); nzDead[w].clear();
             for (auto v : p["encs"].toArray()) { QJsonObject e = v.toObject(); nzEnc[w].push_back({e["area"].toInt(), e["outcome"].toInt(), (qint64)e["ts"].toDouble()}); }
             for (auto v : p["dead"].toArray()) nzDead[w].push_back((uint32_t)v.toDouble());
+            nzLinked[w].clear();
+            for (auto v : p["linked"].toArray()) { QJsonObject l = v.toObject(); nzLinked[w].push_back({(uint32_t)l["pid"].toDouble(), (uint32_t)l["partner"].toDouble(), l["area"].toInt(-1), l["cause"].toString() == "missed"}); }
+            if (w == 0) { nzCorrupt.clear(); for (auto v : p["corrupt"].toArray()) { QJsonObject c = v.toObject(); nzCorrupt.push_back({(uint32_t)c["pid"].toDouble(), c["species"].toInt(), c["level"].toInt(), c["hp"].toInt(), c["maxhp"].toInt()}); } }
         }
     }
     // Who picks first in an area: areas in order of discovery (earliest encounter of either player), starter area = 0 of
@@ -1188,7 +1195,8 @@ private:
         Boss cap = levelCap(johto, kanto, gameClear);
         QStringList lines = { QString("%1  %2  first pick: %3").arg(mapsec >= 0 ? mapsecName(mapsec) : QString("?"), QChar(0x00b7), firstN),
                               QString("Your encounter here: %1").arg(status),
-                              QString("Level cap %1  %2  next boss: %3").arg(cap.cap).arg(QChar(0x00b7)).arg(cap.name),
+                              QString("Level cap %1  %2  next boss: %3%4").arg(cap.cap).arg(QChar(0x00b7)).arg(cap.name)
+                                  .arg(nzSoulLink < 0 ? QString() : QString("  %1  Soul Link %2").arg(QChar(0x00b7)).arg(nzSoulLink ? "on" : "off")),
                               QString("Deaths %1 (%2): %3").arg(myN).arg(nzDead[0].size()).arg(deadNames(0)),
                               QString("Deaths %1 (%2): %3").arg(peerN).arg(nzDead[1].size()).arg(deadNames(1)) };
         g.setPen(Qt::NoPen); g.setBrush(cSlot); g.drawRect(8, y, W - 16, 18 * lines.size() + 4); f.setPointSize(9); g.setFont(f);
@@ -1424,8 +1432,8 @@ private:
         {
             if (p.mine && p.theirs)
             {
-                if (p.mine->status == DEAD && p.theirs->status != DEAD) acts << QString("▶ %1's %2 must go: partner %3 fainted (%4).").arg(peerName, p.theirs->nick, p.mine->nick, areaName(p.area));
-                if (p.theirs->status == DEAD && p.mine->status != DEAD) acts << QString("▶ Your %1 must go: partner %2 fainted (%3).").arg(p.mine->nick, p.theirs->nick, areaName(p.area));
+                if (!nzOn && p.mine->status == DEAD && p.theirs->status != DEAD) acts << QString("▶ %1's %2 must go: partner %3 fainted (%4).").arg(peerName, p.theirs->nick, p.mine->nick, areaName(p.area));
+                if (!nzOn && p.theirs->status == DEAD && p.mine->status != DEAD) acts << QString("▶ Your %1 must go: partner %2 fainted (%3).").arg(p.mine->nick, p.theirs->nick, areaName(p.area));
                 if (!pairDead(p) && p.mine->status != p.theirs->status) acts << QString("▶ Box rule: %1 is in the %2, %3 in the %4.").arg(p.mine->nick, p.mine->status == BOX ? "box" : "team", p.theirs->nick, p.theirs->status == BOX ? "box" : "team");
             }
         }
@@ -1436,6 +1444,18 @@ private:
         // Nuzlocke rule (HGTNuzlocke logs "NICKNAME VERPLICHT"): every Pokémon in the party needs a nickname; without one the name
         // field holds the species name, so that is what we show. Name Rater: Goldenrod City.
         if (nzOn) for (int i = 0; i < nMons; i++) if (!mons[i].egg && !nicked[i]) acts << QString("▶ Give %1 a nickname (Name Rater).").arg(QString::fromLatin1(mons[i].nick));
+        // Kyogre's watcher is the authority once its file exists: Soul Link partners that must go, corrupt entries, same starter
+        auto nickOf = [&](uint32_t pid, bool peerSide) { Entry* e = find(peerSide ? peerLog : log, pid); if (e && e->nick[0]) return QString::fromLatin1(e->nick);
+                                                         if (!peerSide) for (int i = 0; i < nMons; i++) if (mons[i].pid == pid) return QString::fromLatin1(mons[i].nick);
+                                                         return QString("#%1").arg(pid, 8, 16, QChar('0')).toUpper(); };
+        auto where = [&](int area) { return area < 0 ? QString("starter pair") : mapsecName(area); };
+        if (nzOn)
+        {
+            for (auto& l : nzLinked[0]) acts << QString("▶ Your %1 must go: partner %2 (%3).").arg(nickOf(l.pid, false), l.missed ? "missed" : "died", where(l.area));
+            for (auto& l : nzLinked[1]) acts << QString("▶ %1's %2 must go: partner %3 (%4).").arg(peerName, nickOf(l.pid, true), l.missed ? "missed" : "died", where(l.area));
+            for (auto& c : nzCorrupt) acts.prepend(QString("▶ Corrupt data for %1 (Lv %2, HP %3/%4): put it in the PC and take it out again.").arg(nickOf(c.pid, false)).arg(c.level).arg(c.hp).arg(c.maxhp));
+            if (nzSameStarter == 1) acts << QString("▶ You both have the same starter.");
+        }
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
         for (auto& a : acts) { int h = g.fontMetrics().boundingRect(QRect(0, 0, tw, 1000), Qt::TextWordWrap, a).height() + 4; hs << h; ah += h; }

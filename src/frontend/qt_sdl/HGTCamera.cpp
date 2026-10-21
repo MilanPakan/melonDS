@@ -7,6 +7,7 @@
 // de delta van de speler en stuurt lookAt + projectie elk frame naar de GPU, dus de stand blijft staan.
 // shortcut: vast adres van NNS_G3dGlb.projMtx (Sacred Gold v1.05, overworld); upgraden naar een pointer als het ooit verschuift.
 #include "HGTCamera.h"
+#include "HGTGhost.h"
 #include "NDS.h"
 #include <cmath>
 #include <cstdio>
@@ -43,6 +44,9 @@ void apply(NDS& nds)
     }
     if (!env) { on = dock == 1; if (on) { pitch = 30; fov = 45; zoom = 1; } }   // dock-stand (docs/camera.md: aanbevolen)
     if (!on && restored) return;
+    // Alleen in de overworld: tijdens een battle/menu-app blijft FieldSystem+0x24 naar de (mogelijk vrijgegeven) veldcamera wijzen;
+    // daar schrijven we niet in (hardening na de Eevee-corruptie in playtest 1, 2026-10-21).
+    if (!HGTGhost::overworld(nds)) return;
     uint32_t var = nds.ARM9Read32(kFieldSysLiteral); if (!inRam(var)) return;
     uint32_t fs = nds.ARM9Read32(var);               if (!inRam(fs)) return;
     uint32_t cam = nds.ARM9Read32(fs + 0x24);        if (!inRam(cam)) return;
