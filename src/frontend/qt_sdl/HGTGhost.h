@@ -14,12 +14,12 @@ namespace melonDS { class NDS; }
 namespace HGTGhost
 {
 #pragma pack(push, 1)
-struct Info { char name[8]; uint8_t gender; int16_t sprite; uint8_t frames; int32_t py; };   // sprite = mmodel (-1 = Ethan/Lyra naar geslacht), frames = 12 (NPC) of 24; py = hoogte (fx32)
+struct Info { char name[8]; uint8_t gender; int16_t sprite; uint8_t frames; int32_t py; uint8_t johto, kanto; };   // sprite = mmodel (-1 = Ethan/Lyra naar geslacht), frames = 12 (NPC) of 24; py = hoogte (fx32); johto/kanto = badge-bits
 #pragma pack(pop)
 extern std::atomic<int> mySprite, myFrames;   // eigen keuze, gezet door het dock (applySprite)
 
 void init(const std::string& romPath);        // NARC a/0/8/1 uit het ROM-bestand (het dock patcht alleen de cart in het geheugen)
-void readInfo(melonDS::NDS& nds, Info& i);     // naam + geslacht uit het spelersprofiel, sprite uit het dock
+void readInfo(melonDS::NDS& nds, Info& i);     // naam, geslacht en badges uit het spelersprofiel, sprite uit het dock
 // Ghost nr. idx tekenen: me/pos = wereldpositie (x,y,z fx32) van jezelf en van de peer; projectie via de spelcamera,
 // occlusie via de dieptebuffer van de software-renderer; frame = eigen frameteller (ren-cyclus).
 // top/cpu = wat GPU.GetFramebuffers geeft: cpu = BGRA-framebuffer (software), anders &GLuint van de GL-uitvoertextuur.

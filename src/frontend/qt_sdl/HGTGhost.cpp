@@ -113,7 +113,7 @@ void readInfo(NDS& nds, Info& i)
     uint32_t sd = nds.ARM9Read32(fs + 0x0C);         if (!inRam(sd)) return;
     uint32_t prof = sd + 0x74;   // PlayerProfile: name u16[8] (0xFFFF-einde), gender @0x18
     for (int k = 0; k < 8; k++) { uint16_t c = nds.ARM9Read16(prof + 2 * k); i.name[k] = c == 0xFFFF ? 0 : dsChar(c); if (!i.name[k]) break; }
-    i.gender = nds.ARM9Read8(prof + 0x18);
+    i.gender = nds.ARM9Read8(prof + 0x18); i.johto = nds.ARM9Read8(prof + 0x1A); i.kanto = nds.ARM9Read8(prof + 0x1F);   // zelfde bytes als HGTNuzlocke
 }
 
 void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int32_t pos[3], int facing, uint32_t frame, const Info& peer)

@@ -1104,31 +1104,41 @@ private:
         if (!graves) { g.setPen(cWhite); g.drawText(16, y + 14, "Empty. Keep it that way."); y += 24; }
     }
 
-    // Badge case: own badges from the PlayerProfile (same bytes HGTNuzlocke uses for the level cap). The friend's badges are not in
-    // any sync packet (ghost, HGSL, HGNZ), so only our own are shown.
+    // Badge case: own badges from the PlayerProfile (same bytes HGTNuzlocke uses for the level cap), the friend's from the ghost
+    // position packet (HGTGhost::Info.johto/kanto, via HGTogether::peerStatus; first peer, last known value).
     void pageBadges(QPainter& g, int& y)
     {
         int W = width(); QFont f = g.font();
         header(g, y, "BADGE CASE");
         static const char* kNames[16] = {"Zephyr", "Hive", "Plain", "Fog", "Storm", "Mineral", "Glacier", "Rising",
                                          "Boulder", "Cascade", "Thunder", "Rainbow", "Soul", "Marsh", "Volcano", "Earth"};
+        auto peers = HGTogether::peerStatus(); bool havePeer = !peers.empty();
+        QString friendName = havePeer ? QString::fromStdString(peers[0].name) : peerName;
+        int cw = (W - 16) / 8;
         for (int region = 0; region < 2; region++)
         {
-            uint8_t bits = region ? kanto : johto;
-            g.setPen(cWhite); f.setBold(true); g.setFont(f);
-            g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, QString("%1  %2/8").arg(region ? "KANTO" : "JOHTO").arg(__builtin_popcount(bits)));
+            g.setPen(cWhite); f.setBold(true); g.setFont(f); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, region ? "KANTO" : "JOHTO");
             f.setBold(false); g.setFont(f); y += 20;
-            int cw = (W - 16) / 4;
-            for (int i = 0; i < 8; i++)
+            for (int who = 0; who < 2; who++)
             {
-                bool got = bits >> i & 1; QRect c(8 + (i % 4) * cw, y + (i / 4) * 58, cw - 4, 54);
-                g.setPen(QPen(got ? cGold : cBrown.lighter(140), got ? 2 : 1)); g.setBrush(got ? cSlot : cSlotDead); g.drawRoundedRect(c.adjusted(1, 1, -1, -1), 4, 4);
-                g.drawImage(c.center().x() - 16, c.y() + 4, badges.get(region * 8 + i, got));
-                g.setPen(got ? cText : cMuted); f.setPointSize(8); g.setFont(f); g.drawText(QRect(c.x(), c.bottom() - 15, c.width(), 13), Qt::AlignCenter, kNames[region * 8 + i]); f.setPointSize(10); g.setFont(f);
+                if (who && !havePeer) { g.setPen(cMuted); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, QString("%1: not connected").arg(friendName)); y += 22; continue; }
+                uint8_t bits = who ? (region ? peers[0].kanto : peers[0].johto) : (region ? kanto : johto);
+                g.setPen(cWhite); f.setPointSize(8); g.setFont(f);
+                g.drawText(QRect(12, y, W - 24, 14), Qt::AlignVCenter, QString("%1  %2/8").arg(who ? friendName : myName).arg(__builtin_popcount(bits)));
+                f.setPointSize(10); g.setFont(f); y += 15;
+                for (int i = 0; i < 8; i++)
+                {
+                    bool got = bits >> i & 1; QRect c(8 + i * cw, y, cw - 3, 40);
+                    g.setPen(QPen(got ? cGold : cBrown.lighter(140), got ? 2 : 1)); g.setBrush(got ? cSlot : cSlotDead); g.drawRoundedRect(c.adjusted(1, 1, -1, -1), 4, 4);
+                    g.drawImage(c.center().x() - 16, c.y() + 4, badges.get(region * 8 + i, got));
+                }
+                y += 44;
             }
-            y += 2 * 58 + 6;
+            // badge names once per region, under both rows
+            g.setPen(cMuted); f.setPointSize(7); g.setFont(f);
+            for (int i = 0; i < 8; i++) g.drawText(QRect(8 + i * cw, y, cw - 3, 12), Qt::AlignCenter, kNames[region * 8 + i]);
+            f.setPointSize(10); g.setFont(f); y += 18;
         }
-        g.setPen(cMuted); g.drawText(QRect(12, y, W - 24, 18), Qt::AlignVCenter, QString("%1's badges are not synced yet").arg(peerName)); y += 22;
     }
 
     void pageSprite(QPainter& g, int& y)
