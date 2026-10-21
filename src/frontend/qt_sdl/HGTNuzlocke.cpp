@@ -18,6 +18,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -47,16 +48,16 @@ const uint32_t kFieldSysLiteral = 0x0203E304, kTaskWild = 0x02050C18, kTaskEncou
 const int kMapsecLeague = 15, kMapsecIndigo = 147;   // pret constants/map_sections.h: binnen de League vervalt de E4-cap
 enum { PENDING, CAUGHT, MISSED, REROLL };
 struct Enc { int32_t area; uint16_t species; uint32_t pid; uint8_t outcome; int64_t ts; };
-struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg, nicked; uint16_t hp, maxhp; };
+struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg, nicked, busy; uint16_t hp, maxhp; };   // busy: het spel heeft dit record nu ontsleuteld in gebruik
 // party-deel onzin (level 0 of > 100, HP > max): niets afdwingen, alleen melden (playtest 2026-10-21: party-deel onversleuteld weggeschreven)
 bool corrupt(const Mon& m) { return !m.egg && (m.level == 0 || m.level > 100 || m.maxhp == 0 || m.hp > m.maxhp); }
-struct Link { uint32_t pid, partner; int32_t area; uint8_t cause; };   // Soul Link: mijn pid moet weg; cause 0 = partner dood, 1 = partner gemist
-struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned; uint16_t party[6] = {}; uint8_t nParty = 0; uint32_t starter = 0; uint16_t starterSpecies = 0; std::vector<Link> linked; std::vector<Mon> corrupt; };
-struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, starter, soulLink; uint32_t starterPid; uint16_t starterSpecies; uint16_t party[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
+struct Link { uint32_t pid, partner; int32_t area; uint8_t cause, enforce; };   // Soul Link: mijn pid moet weg; cause 0 dood, 1 gemist, 2 partner in de box
+struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned; uint16_t party[6] = {}; uint32_t partyPid[6] = {}; uint8_t nParty = 0; uint32_t starter = 0; uint16_t starterSpecies = 0; std::vector<Link> linked; std::vector<Mon> corrupt; };
+struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, starter, soulLink; uint32_t starterPid; uint16_t starterSpecies; uint16_t party[6]; uint32_t partyPid[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
 
 bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
 std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-thread) leest ze
-int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
+int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
 bool curEligible = false; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
@@ -71,18 +72,23 @@ void decrypt(uint8_t* d, int len, uint32_t seed)
 {
     for (int i = 0; i < len; i += 2) { seed = seed * 1103515245u + 24691u; uint16_t v; memcpy(&v, d + i, 2); v ^= seed >> 16; memcpy(d + i, &v, 2); }
 }
+// Het spel ontsleutelt records soms in RAM zelf en houdt ze zo over meerdere frames (vlaggen op +4: bit 0 partyDecrypted, bit 1
+// boxDecrypted; bv. de meelopende Pokémon in slot 0). Dan zijn die delen al plat: niet nog eens ontsleutelen, anders lees je onzin
+// (bench 2026-10-21: Totodile "Lv105, HP 51119"). In de playtest leidde zo'n leesfout tot een box-write tijdens die vergrendeling,
+// waarna het spel de verschoven Eevee nogmaals "versleutelde" = plat wegschreef. Daarom ook: busy-records nooit verplaatsen.
 bool readMon(NDS& nds, uint32_t a, Mon& m, bool party = true)   // false = checksum klopt niet (half geschreven)
 {
     uint8_t raw[0xEC]; for (int i = 0; i < (party ? 0xEC : 0x88); i++) raw[i] = nds.ARM9Read8(a + i);
-    uint32_t pid; uint16_t checksum; memcpy(&pid, raw, 4); memcpy(&checksum, raw + 6, 2);
-    uint8_t blocks[0x80]; memcpy(blocks, raw + 8, 0x80); decrypt(blocks, 0x80, checksum);
+    uint32_t pid; uint16_t flags, checksum; memcpy(&pid, raw, 4); memcpy(&flags, raw + 4, 2); memcpy(&checksum, raw + 6, 2);
+    uint8_t blocks[0x80]; memcpy(blocks, raw + 8, 0x80); if (!(flags & 2)) decrypt(blocks, 0x80, checksum);
     uint32_t sum = 0; for (int i = 0; i < 0x80; i += 2) { uint16_t v; memcpy(&v, blocks + i, 2); sum += v; }
-    if ((sum & 0xFFFF) != checksum) return false;
+    if ((sum & 0xFFFF) != checksum && !(flags & 2)) return false;   // ontsleuteld in gebruik: checksum kan net bijgewerkt worden
     const uint8_t* order = kOrder[((pid >> 13) & 0x1F) % 24];
-    memset(&m, 0, sizeof m); m.pid = pid; memcpy(&m.species, blocks + order[0] * 0x20, 2);
+    memset(&m, 0, sizeof m); m.pid = pid; m.busy = flags & 3; memcpy(&m.species, blocks + order[0] * 0x20, 2);
     uint32_t ivs; memcpy(&ivs, blocks + order[1] * 0x20 + 0x10, 4); m.egg = (ivs >> 30) & 1; m.nicked = ivs >> 31;   // blok B +0x10: bit 30 isEgg, bit 31 hasNickname
     if (!party) return true;
-    uint8_t pt[0x64]; memcpy(pt, raw + 0x88, 0x64); decrypt(pt, 0x64, pid); m.level = pt[4]; memcpy(&m.hp, pt + 6, 2); memcpy(&m.maxhp, pt + 8, 2);
+    uint8_t pt[0x64]; memcpy(pt, raw + 0x88, 0x64); if (!(flags & 1)) decrypt(pt, 0x64, pid);
+    m.level = pt[4]; memcpy(&m.hp, pt + 6, 2); memcpy(&m.maxhp, pt + 8, 2);
     return true;
 }
 uint32_t saveArray(NDS& nds, int idx) { return saveData + 0x10 + nds.ARM9Read32(saveData + 0x23014 + idx * 0x10 + 8); }
@@ -157,7 +163,20 @@ int firstPicker(int32_t area)   // n-de ontdekte area (starter = nummer 0 van st
 
 // --- Soul Link (docs/soullink.md): de eerste vangst per area van beide spelers is een paar, de starters ook (area -1).
 // Is de partner van de vriend dood, of heeft de vriend zijn encounter in die area gemist, dan moet mijn vangst ook weg. ---
-std::vector<Link> links(const Player& a, const Player& b)   // wat a kwijt moet door b
+bool inParty(const Player& p, uint32_t pid) { for (int i = 0; i < p.nParty && i < 6; i++) if (p.partyPid[i] == pid) return true; return false; }
+// Paren (mijn pid, partner-pid, area) waarvan beide nog leven: vangst-paren per area + het starterpaar (area -1).
+std::vector<Link> pairs(const Player& a, const Player& b)
+{
+    std::vector<Link> out;
+    for (auto& e : a.encs) if (e.outcome == CAUGHT && !has(a.dead, e.pid))
+        for (auto& f : b.encs) if (f.area == e.area && f.outcome == CAUGHT && !has(b.dead, f.pid)) out.push_back({e.pid, f.pid, e.area, 2, 0});
+    if (a.starter && b.starter && !has(a.dead, a.starter) && !has(b.dead, b.starter)) out.push_back({a.starter, b.starter, -1, 2, 0});
+    return out;
+}
+// Box-regel: alleen afdwingen op de overgang team -> box van de partner (gezien in deze sessie), anders kan een paar nooit meer terug in
+// het team: wie als eerste terughaalt zou meteen weer geboxt worden. Een verschil zonder die overgang staat alleen in de json (enforce false).
+std::map<uint32_t, bool> partnerSeenInTeam;
+std::vector<Link> links(const Player& a, const Player& b, bool mine)   // wat a kwijt moet door b
 {
     std::vector<Link> out; if (!soulLink || soulLink != peerSoulLink) return out;
     for (auto& e : a.encs)
@@ -165,27 +184,38 @@ std::vector<Link> links(const Player& a, const Player& b)   // wat a kwijt moet 
         if (e.outcome != CAUGHT || has(a.dead, e.pid)) continue;
         for (auto& f : b.encs) if (f.area == e.area)
         {
-            if (f.outcome == CAUGHT && has(b.dead, f.pid)) out.push_back({e.pid, f.pid, e.area, 0});
-            else if (f.outcome == MISSED) out.push_back({e.pid, 0, e.area, 1});
+            if (f.outcome == CAUGHT && has(b.dead, f.pid)) out.push_back({e.pid, f.pid, e.area, 0, 1});
+            else if (f.outcome == MISSED) out.push_back({e.pid, 0, e.area, 1, 1});
         }
     }
-    if (a.starter && b.starter && !has(a.dead, a.starter) && has(b.dead, b.starter)) out.push_back({a.starter, b.starter, -1, 0});
+    if (a.starter && b.starter && !has(a.dead, a.starter) && has(b.dead, b.starter)) out.push_back({a.starter, b.starter, -1, 0, 1});
+    if (peerParty)
+        for (auto& l : pairs(a, b))
+            if (inParty(a, l.pid) && !inParty(b, l.partner)) { l.enforce = mine && partnerSeenInTeam[l.partner]; out.push_back(l); }
     return out;
 }
 void updateLinks()
 {
-    std::vector<Link> mine = links(me, peer);
+    if (peerParty) for (auto& l : pairs(me, peer))
+    {
+        if (inParty(peer, l.partner)) partnerSeenInTeam[l.partner] = true;
+        else if (!inParty(me, l.pid)) partnerSeenInTeam[l.partner] = false;   // allebei in de box: regel voldaan, terughalen mag
+    }
+    std::vector<Link> mine = links(me, peer, true);
     for (auto& l : mine)
     {
-        bool known = false; for (auto& k : me.linked) known |= k.pid == l.pid;
-        if (!known) nzlog("SOUL LINK: area %d, partner %08X van de vriend is %s -> mijn pid %08X moet weg", l.area, l.partner, l.cause ? "gemist" : "dood", l.pid);
+        bool known = false; for (auto& k : me.linked) known |= k.pid == l.pid && k.enforce == l.enforce;
+        if (known) continue;
+        if (l.cause == 2 && l.enforce) nzlog("SOUL LINK: area %d, partner %08X van de vriend is naar de box -> mijn pid %08X moet ook naar de box", l.area, l.partner, l.pid);
+        else if (l.cause == 2) nzlog("Soul Link: area %d, partner %08X van de vriend staat in de box en mijn pid %08X in het team (niet afgedwongen: geen overgang gezien)", l.area, l.partner, l.pid);
+        else nzlog("SOUL LINK: area %d, partner %08X van de vriend is %s -> mijn pid %08X moet weg", l.area, l.partner, l.cause ? "gemist" : "dood", l.pid);
     }
-    std::vector<Link> theirs = links(peer, me);   // ook de afleiding voor de vriend in de json (het dock toont die)
-    auto same = [](const std::vector<Link>& a, const std::vector<Link>& b) { if (a.size() != b.size()) return false; for (size_t i = 0; i < a.size(); i++) if (a[i].pid != b[i].pid || a[i].cause != b[i].cause) return false; return true; };
+    std::vector<Link> theirs = links(peer, me, false);   // ook de afleiding voor de vriend in de json (het dock toont die)
+    auto same = [](const std::vector<Link>& a, const std::vector<Link>& b) { if (a.size() != b.size()) return false; for (size_t i = 0; i < a.size(); i++) if (a[i].pid != b[i].pid || a[i].cause != b[i].cause || a[i].enforce != b[i].enforce) return false; return true; };
     if (!same(mine, me.linked) || !same(theirs, peer.linked)) dirty = true;
     me.linked = mine; peer.linked = theirs;
 }
-bool linked(uint32_t pid) { for (auto& l : me.linked) if (l.pid == pid) return true; return false; }
+bool linked(uint32_t pid) { for (auto& l : me.linked) if (l.pid == pid && l.enforce) return true; return false; }
 
 // --- opslag + sync ---
 QJsonObject toJson(const Player& p)
@@ -197,7 +227,7 @@ QJsonObject toJson(const Player& p)
     QJsonArray bad;   // party-Pokémon met onzin-waarden (alleen gemeld, niets afgedwongen)
     for (auto& m : p.corrupt) bad.append(QJsonObject{{"pid", (qint64)m.pid}, {"species", m.species}, {"level", m.level}, {"hp", m.hp}, {"maxhp", m.maxhp}});
     QJsonArray linked;   // afgeleid (Soul Link), voor het dock: area -1 = het starter-paar
-    for (auto& l : p.linked) linked.append(QJsonObject{{"pid", (qint64)l.pid}, {"partner", (qint64)l.partner}, {"area", l.area}, {"cause", l.cause ? "missed" : "dead"}});
+    for (auto& l : p.linked) linked.append(QJsonObject{{"pid", (qint64)l.pid}, {"partner", (qint64)l.partner}, {"area", l.area}, {"cause", l.cause == 2 ? "boxed" : l.cause ? "missed" : "dead"}, {"enforce", l.enforce != 0}});
     return {{"encs", encs}, {"dead", dead}, {"banned", banned}, {"starter", (qint64)p.starter}, {"starterSpecies", p.starterSpecies}, {"linked", linked}, {"corrupt", bad}};
 }
 Player fromJson(const QJsonObject& o)
@@ -233,7 +263,7 @@ void exchange()
         p.nEncs = std::min<size_t>(me.encs.size(), 200); memcpy(p.encs, me.encs.data(), sizeof(Enc) * p.nEncs);
         p.nDead = std::min<size_t>(me.dead.size(), 64); memcpy(p.dead, me.dead.data(), 4 * p.nDead);
         p.nBanned = std::min<size_t>(me.banned.size(), 32); memcpy(p.banned, me.banned.data(), 4 * p.nBanned);
-        p.nParty = me.nParty; memcpy(p.party, me.party, sizeof p.party);
+        p.nParty = me.nParty; memcpy(p.party, me.party, sizeof p.party); memcpy(p.partyPid, me.partyPid, sizeof p.partyPid);
         sendto(sock, (const char*)&p, sizeof p, 0, (sockaddr*)&peerAddr, peerLen);
     }
     Packet p; sockaddr_storage from{}; socklen_t fromLen = sizeof from; int n;
@@ -254,7 +284,7 @@ void exchange()
             if (p.soulLink != soulLink) nzlog("SOULLINK-MISMATCH: ik heb HGT_SOULLINK=%d, de vriend %d; Soul Link geldt pas als het gelijk is", soulLink, p.soulLink);
         }
         Player q; q.starter = p.starterPid; q.starterSpecies = p.starterSpecies; q.encs.assign(p.encs, p.encs + p.nEncs); q.dead.assign(p.dead, p.dead + p.nDead); q.banned.assign(p.banned, p.banned + p.nBanned);
-        q.nParty = p.nParty; memcpy(q.party, p.party, sizeof q.party);
+        q.nParty = p.nParty; memcpy(q.party, p.party, sizeof q.party); memcpy(q.partyPid, p.partyPid, sizeof q.partyPid); peerParty = true;
         if (q.encs.size() != peer.encs.size() || memcmp(q.encs.data(), peer.encs.data(), sizeof(Enc) * q.encs.size()) || q.dead != peer.dead || q.banned != peer.banned || q.starter != peer.starter || q.starterSpecies != peer.starterSpecies) dirty = true;
         q.linked = peer.linked; peer = q; if (!peerLen) { memcpy(&peerAddr, &from, fromLen); peerLen = fromLen; }
         fromLen = sizeof from;
@@ -352,7 +382,7 @@ void watchBattleParty(NDS& nds, uint32_t setup)
     for (uint32_t i = 0; i < cur; i++)
     {
         Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
-        if (m.species && m.hp == 0 && !m.egg && !corrupt(m) && !has(me.dead, m.pid)) { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+        if (m.species && m.hp == 0 && !m.egg && !m.busy && !corrupt(m) && !has(me.dead, m.pid)) { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
     }
 }
 void watchEncounter(NDS& nds, uint32_t fs)
@@ -400,7 +430,11 @@ bool box(NDS& nds, uint32_t party, uint32_t cur, int slot)
             for (int i = 0; i < 0xEC; i++) nds.ARM9Write8(party + 8 + k * 0xEC + i, nds.ARM9Read8(party + 8 + (k + 1) * 0xEC + i));
             for (int i = 0; i < 5; i++) nds.ARM9Write8(party + 0x590 + k * 5 + i, nds.ARM9Read8(party + 0x590 + (k + 1) * 5 + i));
         }
+        // laatste slot leeg zoals ZeroMonData: box-deel = lege BoxPokemon (nullen versleuteld met checksum 0, gekopieerd van de lege pc-plek),
+        // party-deel = 0x64 nullen versleuteld met pid 0 (Porygon 2: anders bleef het oude party-deel daar staan)
+        uint8_t zeroParty[0x64] = {}; decrypt(zeroParty, 0x64, 0);
         for (int i = 0; i < 0x88; i++) nds.ARM9Write8(party + 8 + (cur - 1) * 0xEC + i, empty[i]);
+        for (int i = 0; i < 0x64; i++) nds.ARM9Write8(party + 8 + (cur - 1) * 0xEC + 0x88 + i, zeroParty[i]);
         nds.ARM9Write32(party + 4, cur - 1);
         nzlog("-> box %u slot %d", (b + curBox) % 18 + 1, s + 1);
         return true;
@@ -413,8 +447,9 @@ void watchParty(NDS& nds, uint32_t fs, bool idle)
     uint32_t party = saveArray(nds, 2), cur = nds.ARM9Read32(party + 4); if (cur > 6) return;
     Mon mons[6];
     for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, mons[i])) return;   // half geschreven: volgende keer
-    me.nParty = cur; for (uint32_t i = 0; i < cur; i++) me.party[i] = mons[i].species;
+    me.nParty = cur; for (uint32_t i = 0; i < 6; i++) { me.party[i] = i < cur ? mons[i].species : 0; me.partyPid[i] = i < cur ? mons[i].pid : 0; }
     if (!me.starter && me.encs.empty() && cur == 1 && !mons[0].egg) { me.starter = mons[0].pid; me.starterSpecies = mons[0].species; dirty = true; nzlog("starter: soort %u pid %08X (Soul Link-paar met de starter van de vriend)", mons[0].species, mons[0].pid); }
+    for (uint32_t i = 0; i < cur; i++) if (mons[i].busy) return;   // spel heeft een record vast: deze tick niets beslissen of schrijven
     std::vector<Mon> bad; for (uint32_t i = 0; i < cur; i++) if (corrupt(mons[i])) bad.push_back(mons[i]);
     for (auto& m : bad)
     {
