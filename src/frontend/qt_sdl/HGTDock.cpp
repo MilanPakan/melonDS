@@ -4,6 +4,7 @@
 // shortcut: area = mapId and no "missed encounter" detection; switch to the fase 2 encounter watcher's area id when it lands.
 // shortcut: own UDP socket next to the ghost bridge; fold into one transport when the launcher (fase 3) brings ENet/relay.
 #include "HGTDock.h"
+#include "HGTNuzlocke.h"
 #include "EmuInstance.h"
 #include "NDS.h"
 #include "HGTGhost.h"
@@ -1194,6 +1195,8 @@ private:
                 if (!pairDead(p) && p.mine->status != p.theirs->status) acts << QString("▶ Box rule: %1 is in the %2, %3 in the %4.").arg(p.mine->nick, p.mine->status == BOX ? "box" : "team", p.theirs->nick, p.theirs->status == BOX ? "box" : "team");
             }
         }
+        int stMine, stFriend;   // Nuzlocke-watcher (HGTNuzlocke.cpp): beurtvolgorde moet bij beiden gelijk zijn
+        if (HGTNuzlocke::starterMismatch(stMine, stFriend)) acts.prepend(QString("▶ Turn order differs: you have starter setting %1, your friend %2. Restart both with the same join code.").arg(stMine).arg(stFriend));
         auto peers = HGTogether::peerStatus();   // ghost bridge, same source as the status line under the header
         if (std::none_of(peers.begin(), peers.end(), [](auto& p) { return p.connected; })) acts << QString("▶ %1 not connected.").arg(peers.empty() ? QString("Friend") : QString::fromStdString(peers[0].name));
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";

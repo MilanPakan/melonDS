@@ -18,6 +18,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -47,10 +48,11 @@ const int kMapsecLeague = 15, kMapsecIndigo = 147;   // pret constants/map_secti
 enum { PENDING, CAUGHT, MISSED, REROLL };
 struct Enc { int32_t area; uint16_t species; uint32_t pid; uint8_t outcome; int64_t ts; };
 struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned; uint16_t party[6] = {}; uint8_t nParty = 0; };
-struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty; uint16_t party[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
-struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg; uint16_t hp; };
+struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, starter; uint16_t party[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
+struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg, nicked; uint16_t hp; };
 
 bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
+std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-thread) leest ze
 int myIdx = 0, starterFirst = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
 bool curEligible = false; uint32_t bagHidden = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
@@ -75,7 +77,7 @@ bool readMon(NDS& nds, uint32_t a, Mon& m, bool party = true)   // false = check
     if ((sum & 0xFFFF) != checksum) return false;
     const uint8_t* order = kOrder[((pid >> 13) & 0x1F) % 24];
     memset(&m, 0, sizeof m); m.pid = pid; memcpy(&m.species, blocks + order[0] * 0x20, 2);
-    uint32_t ivs; memcpy(&ivs, blocks + order[1] * 0x20 + 0x10, 4); m.egg = (ivs >> 30) & 1;
+    uint32_t ivs; memcpy(&ivs, blocks + order[1] * 0x20 + 0x10, 4); m.egg = (ivs >> 30) & 1; m.nicked = ivs >> 31;   // blok B +0x10: bit 30 isEgg, bit 31 hasNickname
     if (!party) return true;
     uint8_t pt[0x64]; memcpy(pt, raw + 0x88, 0x64); decrypt(pt, 0x64, pid); m.level = pt[4]; memcpy(&m.hp, pt + 6, 2);
     return true;
@@ -139,19 +141,22 @@ Player fromJson(const QJsonObject& o)
 void save()
 {
     dirty = false; if (jsonPath.empty()) return;
-    QFile f(QString::fromStdString(jsonPath)); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(QJsonObject{{"me", toJson(me)}, {"peer", toJson(peer)}}).toJson());
+    QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}};   // starter = wie de starter als eerste koos (run-instelling)
+    if (peerStarter >= 0) { o["peerStarter"] = peerStarter.load(); o["starterMismatch"] = peerStarter != starterFirst; }
+    QFile f(QString::fromStdString(jsonPath)); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(o).toJson());
 }
 void load()
 {
     QFile f(QString::fromStdString(jsonPath)); if (!f.open(QIODevice::ReadOnly)) return;
     QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); me = fromJson(o["me"].toObject()); peer = fromJson(o["peer"].toObject());
+    if (o.contains("starter")) starterFirst = o["starter"].toInt() ? 1 : 0;
 }
 void exchange()
 {
     if (sock < 0) return;
     if (peerLen && frame % 15 == 0)
     {
-        Packet p{}; memcpy(p.magic, "HGNZ", 4); p.idx = myIdx;
+        Packet p{}; memcpy(p.magic, "HGNZ", 4); p.idx = myIdx; p.starter = starterFirst;
         p.nEncs = std::min<size_t>(me.encs.size(), 200); memcpy(p.encs, me.encs.data(), sizeof(Enc) * p.nEncs);
         p.nDead = std::min<size_t>(me.dead.size(), 64); memcpy(p.dead, me.dead.data(), 4 * p.nDead);
         p.nBanned = std::min<size_t>(me.banned.size(), 32); memcpy(p.banned, me.banned.data(), 4 * p.nBanned);
@@ -161,7 +166,15 @@ void exchange()
     Packet p; sockaddr_storage from{}; socklen_t fromLen = sizeof from; int n;
     while ((n = recvfrom(sock, (char*)&p, sizeof p, 0, (sockaddr*)&from, &fromLen)) > 0)
     {
-        if (n != (int)sizeof p || memcmp(p.magic, "HGNZ", 4) || p.idx == myIdx || p.nEncs > 200 || p.nDead > 64 || p.nBanned > 32 || p.nParty > 6) { fromLen = sizeof from; continue; }
+        if (n != (int)sizeof p || memcmp(p.magic, "HGNZ", 4) || p.nEncs > 200 || p.nDead > 64 || p.nBanned > 32 || p.nParty > 6) { fromLen = sizeof from; continue; }
+        static bool sameIdxWarned = false;
+        if (p.idx == myIdx) { if (!sameIdxWarned) nzlog("FOUT: de vriend heeft ook HGT_INSTANCE=%d; sync genegeerd tot dat verschilt", myIdx); sameIdxWarned = true; fromLen = sizeof from; continue; }
+        if (p.starter != peerStarter)
+        {
+            peerStarter = p.starter; dirty = true;
+            if (p.starter != starterFirst) nzlog("BEURT-MISMATCH: ik heb HGT_NUZLOCKE_STARTER=%d, de vriend %d; beurtvolgorde en reroll-recht kloppen niet tot dit gelijk is", starterFirst, p.starter);
+            else nzlog("beurtvolgorde gelijk met de vriend (starter %d)", starterFirst);
+        }
         Player q; q.encs.assign(p.encs, p.encs + p.nEncs); q.dead.assign(p.dead, p.dead + p.nDead); q.banned.assign(p.banned, p.banned + p.nBanned);
         q.nParty = p.nParty; memcpy(q.party, p.party, sizeof q.party);
         if (q.encs.size() != peer.encs.size() || memcmp(q.encs.data(), peer.encs.data(), sizeof(Enc) * q.encs.size()) || q.dead != peer.dead || q.banned != peer.banned) dirty = true;
@@ -176,8 +189,14 @@ void init(const std::string& rom)
     const char* on = getenv("HGT_NUZLOCKE"); if (!on || !*on || *on == '0') return;
     enabled = true;
     if (const char* e = getenv("HGT_INSTANCE")) myIdx = atoi(e) ? 1 : 0;
-    if (const char* e = getenv("HGT_NUZLOCKE_STARTER")) starterFirst = atoi(e) ? 1 : 0;
-    jsonPath = rom + ".nuzlocke.json"; load();
+    jsonPath = rom + ".nuzlocke.json"; load();   // starter uit de run; de omgeving wint, met een melding als die afwijkt
+    if (const char* e = getenv("HGT_NUZLOCKE_STARTER"))
+    {
+        int v = atoi(e) ? 1 : 0;
+        if (QFile::exists(QString::fromStdString(jsonPath)) && v != starterFirst) nzlog("let op: HGT_NUZLOCKE_STARTER=%d wijkt af van de opgeslagen run (%d); %d geldt", v, starterFirst, v);
+        starterFirst = v;
+    }
+    mineStarter = starterFirst; save();   // bestand bestaat altijd vanaf de start
     const char* port = getenv("HGT_PORT"); const char* peerStr = getenv("HGT_PEER");
     if (!port) { nzlog("actief zonder HGT_PORT: geen sync"); return; }
 #ifdef _WIN32
@@ -235,9 +254,21 @@ void finish(uint32_t winFlag)   // winFlag: 1 win, 2 lose, 4 gevangen, 5 gevluch
     nzlog("encounter klaar area %d winFlag %u -> %s%s", curArea, winFlag, caught ? "gevangen" : "geen vangst", caught && !curEligible ? " (VERBODEN, gaat naar de box)" : "");
     curSetup = 0; dirty = true;
 }
+// Doden tijdens de battle: de battle werkt op de party in de BattleSetup (+4 = party[PLAYER]) en schrijft die pas na een
+// gewonnen battle terug. Bij verlies (whiteout) heelt het spel de echte party, dus zonder deze lezing zou een dood daar onzichtbaar zijn.
+void watchBattleParty(NDS& nds, uint32_t setup)
+{
+    uint32_t party = nds.ARM9Read32(setup + 4), cur = inRam(party) ? nds.ARM9Read32(party + 4) : 0; if (cur > 6) return;
+    for (uint32_t i = 0; i < cur; i++)
+    {
+        Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
+        if (m.species && m.hp == 0 && !m.egg && !has(me.dead, m.pid)) { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+    }
+}
 void watchEncounter(NDS& nds, uint32_t fs)
 {
     uint32_t setup = fs ? encounterSetup(nds, fs) : 0;
+    if (setup) watchBattleParty(nds, setup);   // ook trainerbattles
     if (setup && (setup != bagHidden || frame % 30 == 0)) bagHide(nds, setup);
     if (curSetup && setup != curSetup) { finish(0); return; }   // setup weg zonder winFlag (blackout-pad): gemist
     if (!setup) { doneSetup = 0; return; }   // heap hergebruikt hetzelfde adres voor de volgende battle
@@ -256,7 +287,8 @@ void watchEncounter(NDS& nds, uint32_t fs)
     if (!e) { me.encs.push_back({curArea, wild.species, wild.pid, PENDING, now()}); e = &me.encs.back(); }
     e->species = wild.species; e->pid = wild.pid; e->outcome = (dupe && second) ? REROLL : PENDING;
     curEligible = !dupe; dirty = true;
-    nzlog("encounter area %d soort %u Lv%u: %s", curArea, wild.species, wild.level, dupe ? (second ? "dupe, reroll toegestaan (vluchten)" : "dupe, niet vangen") : "eerste encounter, vangen mag");
+    nzlog("encounter area %d soort %u Lv%u (speler %d kiest hier eerst, ik ben %d): %s", curArea, wild.species, wild.level, firstPicker(curArea), myIdx,
+          dupe ? (second ? "dupe, reroll toegestaan (vluchten)" : "dupe, niet vangen") : "eerste encounter, vangen mag");
 }
 
 // --- party: doden markeren, afdwingen in de overworld (dood / verboden / boven de cap -> eerste lege pc-box) ---
@@ -290,6 +322,9 @@ void watchParty(NDS& nds, uint32_t fs, bool idle)
     Mon mons[6];
     for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, mons[i])) return;   // half geschreven: volgende keer
     me.nParty = cur; for (uint32_t i = 0; i < cur; i++) me.party[i] = mons[i].species;
+    static std::vector<uint32_t> nickWarned;   // verplichte nickname: één melding per Pokémon per sessie (naam geven: Name Rater, Goldenrod)
+    for (uint32_t i = 0; i < cur; i++)
+        if (!mons[i].egg && !mons[i].nicked && !has(nickWarned, mons[i].pid)) { nickWarned.push_back(mons[i].pid); nzlog("NICKNAME VERPLICHT: soort %u pid %08X heeft geen bijnaam", mons[i].species, mons[i].pid); }
     for (uint32_t i = 0; i < cur; i++)
         if (mons[i].hp == 0 && !mons[i].egg && !has(me.dead, mons[i].pid)) { me.dead.push_back(mons[i].pid); dirty = true; nzlog("DOOD: soort %u Lv%u pid %08X", mons[i].species, mons[i].level, mons[i].pid); }
     if (!idle) return;
@@ -328,4 +363,9 @@ void HGTNuzlocke::tick(EmuInstance* emu)
     }
     exchange();
     if (dirty && frame % 15 == 0) save();
+}
+
+bool HGTNuzlocke::starterMismatch(int& mine, int& friendValue)
+{
+    mine = mineStarter; friendValue = peerStarter; return enabled && friendValue >= 0 && friendValue != mine;
 }
