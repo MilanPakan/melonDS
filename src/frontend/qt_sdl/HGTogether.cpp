@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <mutex>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -231,6 +232,9 @@ bool ctlStep(NDS& nds)   // true = er loopt een gescript commando
             std::string tmp = std::string(path) + ".tmp"; FILE* f = fopen(tmp.c_str(), "w");
             if (f) { for (int i = 0; i < 16; i++) fprintf(f, "R%d=%08X\n", i, nds.ARM9.R[i]); fprintf(f, "CPSR=%08X\n", nds.ARM9.CPSR);
                 for (u32 i = 0; i < 64; i++) { u32 v = 0; nds.ARM9.DataRead32(nds.ARM9.R[13] + 4 * i, &v); fprintf(f, "SP+%02X=%08X\n", 4 * i, v); }
+                // gebankte registers: in abort-modus staan hier R13/R14 (SP/LR) van de code die crashte (melonDS wisselt ze om)
+                for (int i = 0; i < 3; i++) fprintf(f, "ABT%d=%08X\nSVC%d=%08X\nIRQ%d=%08X\n", i, nds.ARM9.R_ABT[i], i, nds.ARM9.R_SVC[i], i, nds.ARM9.R_IRQ[i]);
+                for (u32 i = 0; i < 64; i++) { u32 v = 0; nds.ARM9.DataRead32(nds.ARM9.R_ABT[0] + 4 * i, &v); fprintf(f, "ASP+%02X=%08X\n", 4 * i, v); }
                 fclose(f); rename(tmp.c_str(), path); }
         }
         else if (c == 'p' && sscanf(a, "%x %511s", &x, path) == 2) { std::vector<u8> v = hexBytes(path); for (size_t i = 0; i < v.size(); i++) nds.ARM9Write8(x + i, v[i]); }
@@ -394,4 +398,12 @@ void HGTogether::tick(EmuInstance* emu)
         fprintf(stderr, "HGT f%u ik(map %d %d,%d r%d) peers %zu eerste(map %d %d,%d r%d)\n", frame, me.mapId, me.x, me.z, me.facing,
                 peers.size(), p ? p->mapId : 0, p ? p->x : 0, p ? p->z : 0, p ? p->facing : 0);
     }
+}
+
+// Uitnodiging: stub (role 0) tot de echte afhandeling er is, zodat het dock al kan compileren en mergen.
+namespace HGTogether
+{
+static std::mutex inviteMx; static InviteStatus invite;
+InviteStatus inviteStatus() { std::lock_guard<std::mutex> l(inviteMx); return invite; }
+void inviteAnswer(bool accept) { std::lock_guard<std::mutex> l(inviteMx); (void)accept; }
 }
