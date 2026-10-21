@@ -831,7 +831,7 @@ private:
     // Stored next to the ROM in <rom>.view as "diorama sharp" (0/1 each), applied at start; the launcher has no setting for it.
     bool viewDiorama = false, viewSharp = false; QRect dioramaRect, sharpRect;
     int page = 0; std::vector<QRect> tabRects;   // Pokegear-style tool tabs: 0 none, 1 Graveyard, 2 Trainer Sprite, 3 Badges; Soul Link is always shown
-    Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; qint64 peerSeen = 0; int contentHeight = 400, ticks = 0, shotTicks = 0;
+    Mon peerMons[6]; int nPeerMons = 0; std::vector<Entry> peerLog; int contentHeight = 400, ticks = 0, shotTicks = 0;
 
     // --- data ---
     bool readParty(NDS& nds)
@@ -1003,7 +1003,7 @@ private:
             Packet p; qint64 n = sock.readDatagram((char*)&p, sizeof p);
             if (n != sizeof p || memcmp(p.magic, "HGSL", 4) || p.nMons > 6 || p.nEntries > 120) continue;
             p.name[7] = 0; peerName = p.name; nPeerMons = p.nMons; memcpy(peerMons, p.mons, sizeof(Mon) * p.nMons);
-            peerLog.assign(p.entries, p.entries + p.nEntries); peerSeen = QDateTime::currentMSecsSinceEpoch();
+            peerLog.assign(p.entries, p.entries + p.nEntries);
         }
         update();
     }
@@ -1194,8 +1194,8 @@ private:
                 if (!pairDead(p) && p.mine->status != p.theirs->status) acts << QString("▶ Box rule: %1 is in the %2, %3 in the %4.").arg(p.mine->nick, p.mine->status == BOX ? "box" : "team", p.theirs->nick, p.theirs->status == BOX ? "box" : "team");
             }
         }
-        qint64 since = peerSeen ? (QDateTime::currentMSecsSinceEpoch() - peerSeen) / 1000 : -1;
-        if (!(since >= 0 && since < 3)) acts << "▶ Friend not connected.";
+        auto peers = HGTogether::peerStatus();   // ghost bridge, same source as the status line under the header
+        if (std::none_of(peers.begin(), peers.end(), [](auto& p) { return p.connected; })) acts << QString("▶ %1 not connected.").arg(peers.empty() ? QString("Friend") : QString::fromStdString(peers[0].name));
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
         for (auto& a : acts) { int h = g.fontMetrics().boundingRect(QRect(0, 0, tw, 1000), Qt::TextWordWrap, a).height() + 4; hs << h; ah += h; }
