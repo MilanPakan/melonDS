@@ -20,6 +20,9 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <fcntl.h>
+#include <io.h>   // open/read voor de HGT_CTL-pijp; op Windows alleen compileerbaar, een FIFO bestaat daar niet
+#define O_NONBLOCK 0
 typedef int socklen_t;
 #else
 #include <arpa/inet.h>
