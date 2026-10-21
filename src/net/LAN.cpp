@@ -17,6 +17,7 @@
 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef __WIN32__
@@ -71,8 +72,11 @@ enum
     Cmd_PlayerDisconnect,   // 05 -- both -- signal disconnected state (not receiving MP frames)
 };
 
-const int kDiscoveryPort = 7063;
-const int kLANPort = 7064;
+// HG-Together: poorten instelbaar (HGT_LAN_PORT = LAN-poort, discovery = poort-1), zodat meerdere LAN-sessies op één
+// machine (GUI-vensters naast headless tests in Docker, die via docker0 elkaars broadcasts zien) elkaar niet storen.
+static int lanPort() { const char* e = getenv("HGT_LAN_PORT"); int p = e ? atoi(e) : 0; return p > 0 ? p : 7064; }
+#define kDiscoveryPort (lanPort() - 1)
+#define kLANPort lanPort()
 
 
 LAN::LAN() noexcept : Inited(false)
