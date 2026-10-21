@@ -654,7 +654,7 @@ void decrypt(uint8_t* d, int len, uint32_t seed)
     }
 }
 
-bool readMon(NDS& nds, uint32_t a, Mon& m)
+bool readMon(NDS& nds, uint32_t a, Mon& m, bool* nicked = nullptr)
 {
     uint8_t raw[0xEC]; for (int i = 0; i < 0xEC; i++) raw[i] = nds.ARM9Read8(a + i);
     uint32_t pid; uint16_t checksum; memcpy(&pid, raw, 4); memcpy(&checksum, raw + 6, 2);
@@ -665,7 +665,7 @@ bool readMon(NDS& nds, uint32_t a, Mon& m)
     auto blk = [&](int which) { return blocks + order[which] * 0x20; };
     memset(&m, 0, sizeof m); m.pid = pid;
     memcpy(&m.species, blk(0), 2);
-    uint32_t ivs; memcpy(&ivs, blk(1) + 0x10, 4); m.egg = (ivs >> 30) & 1;
+    uint32_t ivs; memcpy(&ivs, blk(1) + 0x10, 4); m.egg = (ivs >> 30) & 1; if (nicked) *nicked = ivs >> 31;   // block B +0x10: bit 31 hasNickname (as HGTNuzlocke)
     for (int i = 0; i < 10; i++) { uint16_t c; memcpy(&c, blk(2) + 2 * i, 2); if (c == 0xFFFF) break; m.nick[i] = HGTGhost::dsChar(c); }
     uint8_t party[0x64]; memcpy(party, raw + 0x88, 0x64); decrypt(party, 0x64, pid);
     m.level = party[4]; memcpy(&m.hp, party + 6, 2); memcpy(&m.maxhp, party + 8, 2);
@@ -827,6 +827,7 @@ public:
 private:
     EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0, port = 0, instance = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
+    bool nicked[6] = {};   // hasNickname per party slot, kept outside Mon (Mon is part of the HGSL packet)
     Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites; Badges badges;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
     // Nuzlocke state, read-only from <rom>.nuzlocke.json (HGTNuzlocke.cpp writes it: {"me"|"peer": {encs:[{area=mapsec, species, pid,
@@ -869,9 +870,9 @@ private:
         gender = nds.ARM9Read8(prof + 0x18); johto = nds.ARM9Read8(prof + 0x1A); kanto = nds.ARM9Read8(prof + 0x1F); gameClear = nds.ARM9Read8(prof + 0x1D) & 1;
         uint32_t party = saveData + 0x10 + nds.ARM9Read32(hdr + 8), cur = nds.ARM9Read32(party + 4); if (cur > 6) return false;
         Mon tmp[6]; int n = 0;
-        for (uint32_t i = 0; i < cur; i++) if (readMon(nds, party + 8 + i * 0xEC, tmp[n])) n++;
+        bool nk[6] = {}; for (uint32_t i = 0; i < cur; i++) if (readMon(nds, party + 8 + i * 0xEC, tmp[n], &nk[n])) n++;
         if (n != (int)cur) return false;   // torn read (emu thread mid-write): try again next tick
-        memcpy(mons, tmp, sizeof mons); nMons = n; return true;
+        memcpy(mons, tmp, sizeof mons); memcpy(nicked, nk, sizeof nicked); nMons = n; return true;
     }
 
     Entry* find(std::vector<Entry>& v, uint32_t pid) { for (auto& e : v) if (e.pid == pid) return &e; return nullptr; }
@@ -1360,6 +1361,9 @@ private:
         if (HGTNuzlocke::starterMismatch(stMine, stFriend)) acts.prepend(QString("▶ Turn order differs: you have starter setting %1, your friend %2. Restart both with the same join code.").arg(stMine).arg(stFriend));
         auto peers = HGTogether::peerStatus();   // ghost bridge, same source as the status line under the header
         if (std::none_of(peers.begin(), peers.end(), [](auto& p) { return p.connected; })) acts << QString("▶ %1 not connected.").arg(peers.empty() ? QString("Friend") : QString::fromStdString(peers[0].name));
+        // Nuzlocke rule (HGTNuzlocke logs "NICKNAME VERPLICHT"): every Pokémon in the party needs a nickname; without one the name
+        // field holds the species name, so that is what we show. Name Rater: Goldenrod City.
+        if (nzOn) for (int i = 0; i < nMons; i++) if (!mons[i].egg && !nicked[i]) acts << QString("▶ Give %1 a nickname (Name Rater, Goldenrod).").arg(QString::fromLatin1(mons[i].nick));
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
         for (auto& a : acts) { int h = g.fontMetrics().boundingRect(QRect(0, 0, tw, 1000), Qt::TextWordWrap, a).height() + 4; hs << h; ah += h; }
