@@ -475,6 +475,18 @@ void HGTogether::tick(EmuInstance* emu)
             fprintf(stderr, "HGT: story-sync %u gewijzigde bytes naar de ander\n", cnt); storyState = 0;
         }
     }
+    // verloren co-op-battle aan de joiner-kant: COPY zet HGT.active (kSignal+20) op 2 -> zodra de vriend vrij in de
+    // overworld staat ook een whiteout (script 9022 uit bench/hgtscript.py, HGT_WHITEOUT_SCRIPT), zoals bij de leader
+    if (hook && nds.ARM9Read32(kSignal + 20) == 2 && !call.active && !call.pending)
+    {
+        uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0, pm = inRam(fs) ? nds.ARM9Read32(fs) : 0;
+        if (inRam(fs) && !nds.ARM9Read32(fs + 0x10) && !(inRam(pm) && inRam(nds.ARM9Read32(pm + 4))))
+        {
+            const char* ws = getenv("HGT_WHITEOUT_SCRIPT"); nds.ARM9Write32(kSignal + 20, 0);
+            call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = ws ? atoi(ws) : 9022; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true;
+            fprintf(stderr, "HGT: co-op-battle verloren -> whiteout (script %u)\n", call.a[1]);
+        }
+    }
     if (storyPending.size() >= 2)
     {
         uint32_t fb = flagsBlock(nds); uint16_t cnt = storyPending[0] | storyPending[1] << 8;
