@@ -71,20 +71,20 @@ void init(const std::string& romPath)
 
 namespace
 {
-struct Cam { double pos[3], f[3], s[3], u[3], cot, aspect, halfH, near, far; bool ortho; };
+struct Cam { double pos[3], f[3], s[3], u[3], cot, aspect, halfH, zNear, zFar; bool ortho; };
 void v3(NDS& nds, uint32_t a, double* o) { for (int k = 0; k < 3; k++) o[k] = (int32_t)nds.ARM9Read32(a + 4 * k) / 4096.0; }
 void cross(const double* a, const double* b, double* o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
 double dot(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 bool norm(double* a) { double l = sqrt(dot(a, a)); if (l < 1e-9) return false; for (int k = 0; k < 3; k++) a[k] /= l; return true; }
 
-bool readCam(NDS& nds, Cam& c)   // Camera: perspective {fovySin, fovyCos, aspect, near, far} @0, lookAt {pos, target, up} @0x14
+bool readCam(NDS& nds, Cam& c)   // Camera: perspective {fovySin, fovyCos, aspect, zNear, zFar} @0, lookAt {pos, target, up} @0x14
 {
     uint32_t var = nds.ARM9Read32(kFieldSysLiteral); if (!inRam(var)) return false;
     uint32_t fs = nds.ARM9Read32(var);               if (!inRam(fs)) return false;
     uint32_t cam = nds.ARM9Read32(fs + 0x24);        if (!inRam(cam)) return false;
     int32_t fsin = nds.ARM9Read32(cam), fcos = nds.ARM9Read32(cam + 4), asp = nds.ARM9Read32(cam + 8);
     if (fsin <= 0 || asp <= 0) return false;
-    c.cot = (double)fcos / fsin; c.aspect = asp / 4096.0; c.near = (int32_t)nds.ARM9Read32(cam + 12) / 4096.0; c.far = (int32_t)nds.ARM9Read32(cam + 16) / 4096.0;
+    c.cot = (double)fcos / fsin; c.aspect = asp / 4096.0; c.zNear = (int32_t)nds.ARM9Read32(cam + 12) / 4096.0; c.zFar = (int32_t)nds.ARM9Read32(cam + 16) / 4096.0;
     c.ortho = nds.ARM9Read8(cam + 0x44) == 1; c.halfH = (double)fsin / fcos * ((int32_t)nds.ARM9Read32(cam + 0x38) / 4096.0);   // ortho: halve hoogte = tan * distance
     double target[3], up[3]; v3(nds, cam + 0x14, c.pos); v3(nds, cam + 0x20, target); v3(nds, cam + 0x2C, up);
     for (int k = 0; k < 3; k++) c.f[k] = target[k] - c.pos[k];
@@ -193,8 +193,8 @@ void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int
     // Z-buffer (melonDS GPU3D.cpp): 0x200 * (0x3FFF + 0x4000 * z/w), NNS-projectie: ortho z/w = (2w-f-n)/(f-n) (binnen), perspectief
     // (f+n)/(f-n) - 2fn/((f-n)w) (buiten, Route 30: voorspelt de gemeten torso-diepte binnen 1 %). W-buffer: evenredig met w (ortho: overal gelijk).
     bool wbuf = nds.GPU.GPU3D.FlushAttributes & 2;
-    double k = dme && dme < 0xFFFFFF && cam.far > cam.near && !(wbuf && cam.ortho) ? dme / mw : 0, q = 0x200 * 0x4000 * 2.0 / (cam.far - cam.near);
-    auto D = [&](double w) { return wbuf ? k * w : cam.ortho ? dme + q * (w - mw) : dme + q * cam.far * cam.near * (1 / mw - 1 / w); };
+    double k = dme && dme < 0xFFFFFF && cam.zFar > cam.zNear && !(wbuf && cam.ortho) ? dme / mw : 0, q = 0x200 * 0x4000 * 2.0 / (cam.zFar - cam.zNear);
+    auto D = [&](double w) { return wbuf ? k * w : cam.ortho ? dme + q * (w - mw) : dme + q * cam.zFar * cam.zNear * (1 / mw - 1 / w); };
     uint32_t gdepth = (uint32_t)std::max(0.0, D(gw - 8));   // min een halve tegel: de onderrand van de textuur ligt vóór het positiepunt
     if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f %s-buffer %s %s x%d\n", gw, mw, sc, k / 4096, wbuf ? "W" : "Z", cam.ortho ? "ortho" : "perspectief", cpu ? "software" : depth.empty() ? "opengl zonder diepte" : "opengl", t.S);
     const uint8_t* fr = d + tex + fi * 512; bool mirror = facing == 3; int S = t.S;
