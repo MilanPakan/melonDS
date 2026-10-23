@@ -831,7 +831,7 @@ private:
     EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0, port = 0, instance = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
     bool nicked[6] = {};   // hasNickname per party slot, kept outside Mon (Mon is part of the HGSL packet)
-    Mon mons[6]; int nMons = 0; std::vector<Entry> log; Icons icons; Sprites sprites; Badges badges;
+    Mon mons[6]; int nMons = 0; bool partyBad = false; std::vector<Entry> log; Icons icons; Sprites sprites; Badges badges;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
     // Nuzlocke state, read-only from <rom>.nuzlocke.json (HGTNuzlocke.cpp writes it: {"me"|"peer": {encs:[{area=mapsec, species, pid,
     // outcome 0 pending/1 caught/2 missed/3 reroll, ts}], dead:[pid], banned:[pid]}}). Missing file = Nuzlocke off.
@@ -884,8 +884,12 @@ private:
         gender = nds.ARM9Read8(prof + 0x18); johto = nds.ARM9Read8(prof + 0x1A); kanto = nds.ARM9Read8(prof + 0x1F); gameClear = nds.ARM9Read8(prof + 0x1D) & 1;
         uint32_t party = saveData + 0x10 + nds.ARM9Read32(hdr + 8), cur = nds.ARM9Read32(party + 4); if (cur > 6) return false;
         Mon tmp[6]; int n = 0;
-        bool nk[6] = {}; for (uint32_t i = 0; i < cur; i++) if (readMon(nds, party + 8 + i * 0xEC, tmp[n], &nk[n])) n++;
-        if (n != (int)cur) return false;   // torn read (emu thread mid-write): try again next tick
+        // party part has no checksum: a read mid-write gave Lv105 / HP 51119/17440 (playtest) -> drop it, as HGTNuzlocke's corrupt()
+        bool nk[6] = {}; uint32_t bad = 0, torn = 0;
+        for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, tmp[n], &nk[n])) torn++;
+            else { Mon& m = tmp[n]; if (m.egg || (m.level >= 1 && m.level <= 100 && m.maxhp && m.hp <= m.maxhp)) n++; else bad++; }
+        if (!torn && (bad > 0) != partyBad) { partyBad = bad > 0; fprintf(stderr, "HGT: dock: party-lezing %s\n", bad ? "onzin (level/HP), vorige party blijft staan" : "weer goed"); }
+        if (n != (int)cur) return false;   // torn read (emu thread mid-write) or nonsense: keep the last party, try again next tick
         memcpy(mons, tmp, sizeof mons); memcpy(nicked, nk, sizeof nicked); nMons = n; return true;
     }
 
