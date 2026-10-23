@@ -44,7 +44,7 @@ using namespace melonDS;
 
 namespace
 {
-const uint32_t kFieldSysLiteral = 0x0203E304, kTaskWild = 0x02050C18, kTaskEncounter = 0x02050738, kTaskSafari = 0x02050D1C, kTaskBugContest = 0x02050EB8, kMapHeaders = 0x020F6BE0;
+const uint32_t kFieldSysLiteral = 0x0203E304, kTaskWild = 0x02050C18, kTaskEncounter = 0x02050738, kTaskSafari = 0x02050D1C, kTaskBugContest = 0x02050EB8, kTaskLink = 0x020508B8, kHgtActive = 0x02078B18, kMapHeaders = 0x020F6BE0;
 const int kMapsecLeague = 15, kMapsecIndigo = 147;   // pret constants/map_sections.h: binnen de League vervalt de E4-cap
 enum { PENDING, CAUGHT, MISSED, REROLL };
 struct Enc { int32_t area; uint16_t species; uint32_t pid; uint8_t outcome; int64_t ts; };
@@ -59,6 +59,7 @@ bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr
 std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-thread) leest ze
 // calm: ARM9 wacht op vblank (spel niet midden in zijn werk)
 int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false, calm = false, partyDue = false; uint32_t calmTicks = 0, allTicks = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
+std::vector<uint32_t> pendingDead; uint32_t linkSetup = 0;   // doden in een linkbattle (co-op): pas definitief als die normaal eindigt
 bool curEligible = false; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
@@ -357,14 +358,15 @@ void bagRestore(NDS& nds)   // aanroep alleen in de overworld: saveData is dan n
 }
 
 // --- encounter-watcher: taakketen FS+0x10 -> prev; Task_Wild/Safari/BugContestEncounter en Task_StartEncounter hebben env+0x10 = BattleSetup
-//     (Safari en Bug Contest zijn wilde encounters met een eigen taak; zonder deze twee waren vangsten daar een vrije "gift") ---
+//     (Safari en Bug Contest zijn wilde encounters met een eigen taak; zonder deze twee waren vangsten daar een vrije "gift").
+//     Task_020508B8 = linkbattle (co-op via de cave van doel A, Colosseum): Encounter, setup ook op env+0x10 ---
 uint32_t encounterSetup(NDS& nds, uint32_t fs)
 {
     uint32_t t = nds.ARM9Read32(fs + 0x10);
     for (int i = 0; inRam(t) && i < 8; i++, t = nds.ARM9Read32(t))
     {
         uint32_t func = nds.ARM9Read32(t + 4) & ~1u;
-        if (func == kTaskWild || func == kTaskEncounter || func == kTaskSafari || func == kTaskBugContest) { uint32_t s = nds.ARM9Read32(nds.ARM9Read32(t + 0xC) + 0x10); return inRam(s) ? s : 0; }
+        if (func == kTaskWild || func == kTaskEncounter || func == kTaskSafari || func == kTaskBugContest || func == kTaskLink) { uint32_t s = nds.ARM9Read32(nds.ARM9Read32(t + 0xC) + 0x10); return inRam(s) ? s : 0; }
     }
     return 0;
 }
@@ -384,7 +386,10 @@ void watchBattleParty(NDS& nds, uint32_t setup)
     for (uint32_t i = 0; i < cur; i++)
     {
         Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
-        if (m.species && m.hp == 0 && !m.egg && !m.busy && !corrupt(m) && !has(me.dead, m.pid)) { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+        if (!m.species || m.hp || m.egg || m.busy || corrupt(m) || has(me.dead, m.pid) || has(pendingDead, m.pid)) continue;
+        // linkbattle: de fork van doel A zet bij wegvallen van de ander de savestate van vóór de co-op terug; dan leeft hij weer
+        if (nds.ARM9Read32(setup) & 4) { pendingDead.push_back(m.pid); nzlog("DOOD (linkbattle, voorlopig tot het einde): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+        else { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
     }
 }
 void watchEncounter(NDS& nds, uint32_t fs)
@@ -392,6 +397,21 @@ void watchEncounter(NDS& nds, uint32_t fs)
     uint32_t setup = fs ? encounterSetup(nds, fs) : 0;
     if (setup && calm) watchBattleParty(nds, setup);   // ook trainerbattles; alleen als het spel stilstaat
     if (setup && (setup != bagHidden || frame % 30 == 0)) bagHide(nds, setup);
+    if (linkSetup && setup != linkSetup)   // linkbattle weg zonder einde: savestate-restore (co-op afgebroken) of Colosseum
+    {
+        if (!pendingDead.empty()) nzlog("linkbattle zonder einde (restore of Colosseum): %zu voorlopige dood vervalt", pendingDead.size());
+        pendingDead.clear(); linkSetup = 0;
+    }
+    if (setup && (nds.ARM9Read32(setup) & 4))
+    {
+        linkSetup = setup;
+        // normaal einde: winFlag gezet terwijl de co-op loopt (HGT.active 1; vriendschappelijke Colosseum-battles tellen niet)
+        if (nds.ARM9Read32(setup + 0x14) && nds.ARM9Read32(kHgtActive) == 1 && !pendingDead.empty())
+        {
+            for (uint32_t pid : pendingDead) { me.dead.push_back(pid); nzlog("DOOD (co-op, battle klaar winFlag %u): pid %08X", nds.ARM9Read32(setup + 0x14), pid); }
+            pendingDead.clear(); dirty = true;
+        }
+    }
     if (curSetup && setup != curSetup) { finish(0); return; }   // setup weg zonder winFlag (blackout-pad): gemist
     if (!setup) { doneSetup = 0; return; }   // heap hergebruikt hetzelfde adres voor de volgende battle
     if (setup == doneSetup) return;
