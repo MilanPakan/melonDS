@@ -387,7 +387,7 @@ void watchBattleParty(NDS& nds, uint32_t setup)
     {
         Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
         if (!m.species || m.hp || m.egg || m.busy || corrupt(m) || has(me.dead, m.pid) || has(pendingDead, m.pid)) continue;
-        // linkbattle: de fork van doel A zet bij wegvallen van de ander de savestate van vóór de co-op terug; dan leeft hij weer
+        // linkbattle: de setup-party komt pas bij het einde bij, maar de fork van doel A kan dan nog de savestate van vóór de co-op terugzetten
         if (nds.ARM9Read32(setup) & 4) { pendingDead.push_back(m.pid); nzlog("DOOD (linkbattle, voorlopig tot het einde): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
         else { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
     }
