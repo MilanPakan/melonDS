@@ -1,7 +1,7 @@
 // HG-Together fase 1: de ghost tekenen met de sprite (mmodel uit het pakket) en naam van de ander. Frames komen uit het
 // ROM-bestand op schijf (NARC a/0/8/1), frame-tabel + timing uit docs/fase1-sprites.md.
 // Perspectief: projectie via de spelcamera (Camera op FieldSystem+0x24, zelfde lookAt/fovy als NNS_G3dGlb); occlusie: pixels waar de
-// dieptebuffer (W-buffering = kijkdiepte in fx32) dichterbij ligt dan de ghost min een halve tegel.
+// dieptebuffer dichterbij ligt dan de ghost min een halve tegel (Z- of W-buffer, ortho of perspectief: zie draw).
 // OpenGL-renderer: het vlak rond de ghost wordt uit de uitvoertextuur van het bovenscherm teruggelezen (glReadPixels), op de interne
 // resolutie (schaal S, nearest-neighbour) overschreven en teruggeschreven, vóór drawScreen op dezelfde emu-thread. Occlusie onder GL:
 // de 3D-renderer schrijft gl_FragDepth = DS-diepte / 2^24, dus de dieptetextuur van zijn MainFramebuffer heeft dezelfde schaal als de
@@ -71,7 +71,7 @@ void init(const std::string& romPath)
 
 namespace
 {
-struct Cam { double pos[3], f[3], s[3], u[3], cot, aspect, halfH; bool ortho; };
+struct Cam { double pos[3], f[3], s[3], u[3], cot, aspect, halfH, near, far; bool ortho; };
 void v3(NDS& nds, uint32_t a, double* o) { for (int k = 0; k < 3; k++) o[k] = (int32_t)nds.ARM9Read32(a + 4 * k) / 4096.0; }
 void cross(const double* a, const double* b, double* o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
 double dot(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
@@ -84,7 +84,7 @@ bool readCam(NDS& nds, Cam& c)   // Camera: perspective {fovySin, fovyCos, aspec
     uint32_t cam = nds.ARM9Read32(fs + 0x24);        if (!inRam(cam)) return false;
     int32_t fsin = nds.ARM9Read32(cam), fcos = nds.ARM9Read32(cam + 4), asp = nds.ARM9Read32(cam + 8);
     if (fsin <= 0 || asp <= 0) return false;
-    c.cot = (double)fcos / fsin; c.aspect = asp / 4096.0;
+    c.cot = (double)fcos / fsin; c.aspect = asp / 4096.0; c.near = (int32_t)nds.ARM9Read32(cam + 12) / 4096.0; c.far = (int32_t)nds.ARM9Read32(cam + 16) / 4096.0;
     c.ortho = nds.ARM9Read8(cam + 0x44) == 1; c.halfH = (double)fsin / fcos * ((int32_t)nds.ARM9Read32(cam + 0x38) / 4096.0);   // ortho: halve hoogte = tan * distance
     double target[3], up[3]; v3(nds, cam + 0x14, c.pos); v3(nds, cam + 0x20, target); v3(nds, cam + 0x2C, up);
     for (int k = 0; k < 3; k++) c.f[k] = target[k] - c.pos[k];
@@ -152,8 +152,8 @@ void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int
     if (!readCam(nds, cam) || !project(cam, me, mx, my, mw) || !project(cam, pos, gx, gy, gw)) return;
     double sc = cam.ortho ? 1 : mw / gw, size = 32 * sc; if (size < 2 || size > 128) return;
     double ox = gx + (kTexX - mx) * sc, oy = gy + (kTexY - my) * sc;   // textuur-oorsprong in DS-pixels
-    // Dieptebuffer (W-buffering) = k * kijkdiepte; k ijken op de eigen billboard (torso-pixel), want de hardware-W is ~2.24x de
-    // lookAt-diepte (oorzaak niet gevonden). Geen 3D-pixel daar -> geen occlusie. Software: DepthBuffer; OpenGL: dieptetextuur (zie boven).
+    // Dieptebuffer als functie van de kijkdiepte w, geankerd op de eigen billboard (torso-pixel, diepte dme bij mw). Geen 3D-pixel daar
+    // -> geen occlusie. Software: DepthBuffer; OpenGL: dieptetextuur (zie boven).
     auto* r3d = cpu ? dynamic_cast<SoftRenderer3D*>(&nds.GPU.GetRenderer().Get3DRenderer()) : nullptr;
     uint32_t dme = r3d ? r3d->GetDepth(128, 88) : 0;
     Target t{}; std::vector<u32> buf; std::vector<float> depth;   // depth: GL-diepte van het vlak (0..1), leeg = geen GL-occlusie
@@ -190,9 +190,13 @@ void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int
 #endif
     }
 
-    double k = dme && dme < 0xFFFFFF ? dme / mw : 0;
-    uint32_t gdepth = (uint32_t)(k * (gw - 8));   // min een halve tegel: de onderrand van de textuur ligt vóór het positiepunt
-    if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f %s x%d\n", gw, mw, sc, k / 4096, cpu ? "software" : depth.empty() ? "opengl zonder diepte" : "opengl", t.S);
+    // Z-buffer (melonDS GPU3D.cpp): 0x200 * (0x3FFF + 0x4000 * z/w), NNS-projectie: ortho z/w = (2w-f-n)/(f-n) (binnen), perspectief
+    // (f+n)/(f-n) - 2fn/((f-n)w) (buiten, Route 30: voorspelt de gemeten torso-diepte binnen 1 %). W-buffer: evenredig met w (ortho: overal gelijk).
+    bool wbuf = nds.GPU.GPU3D.FlushAttributes & 2;
+    double k = dme && dme < 0xFFFFFF && cam.far > cam.near && !(wbuf && cam.ortho) ? dme / mw : 0, q = 0x200 * 0x4000 * 2.0 / (cam.far - cam.near);
+    auto D = [&](double w) { return wbuf ? k * w : cam.ortho ? dme + q * (w - mw) : dme + q * cam.far * cam.near * (1 / mw - 1 / w); };
+    uint32_t gdepth = (uint32_t)std::max(0.0, D(gw - 8));   // min een halve tegel: de onderrand van de textuur ligt vóór het positiepunt
+    if (frame % 600 == 0 && idx == 0) fprintf(stderr, "HGT: ghost w=%.1f (ik %.1f) schaal %.2f k=%.3f %s-buffer %s %s x%d\n", gw, mw, sc, k / 4096, wbuf ? "W" : "Z", cam.ortho ? "ortho" : "perspectief", cpu ? "software" : depth.empty() ? "opengl zonder diepte" : "opengl", t.S);
     const uint8_t* fr = d + tex + fi * 512; bool mirror = facing == 3; int S = t.S;
     for (int Y = (int)ceil(oy * S); Y < (int)ceil((oy + size) * S); Y++)
         for (int X = (int)ceil(ox * S); X < (int)ceil((ox + size) * S); X++)
