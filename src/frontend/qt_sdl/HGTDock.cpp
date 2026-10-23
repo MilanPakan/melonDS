@@ -672,7 +672,8 @@ bool readMon(NDS& nds, uint32_t a, Mon& m, bool* nicked = nullptr)
     for (int i = 0; i < 10; i++) { uint16_t c; memcpy(&c, blk(2) + 2 * i, 2); if (c == 0xFFFF) break; m.nick[i] = HGTGhost::dsChar(c); }
     uint8_t party[0x64]; memcpy(party, raw + 0x88, 0x64); if (!(flags & 1)) decrypt(party, 0x64, pid);
     m.level = party[4]; memcpy(&m.hp, party + 6, 2); memcpy(&m.maxhp, party + 8, 2);
-    return true;
+    // party part has no checksum: a read mid-write gives Lv105 / HP 51119/17440 (playtest) -> drop it, as HGTNuzlocke's corrupt()
+    return m.egg || (m.level >= 1 && m.level <= 100 && m.maxhp && m.hp <= m.maxhp);
 }
 
 // --- ROM icon sprites (a/0/2/0 = poke_icon.narc: file 0 NCLR, file 7+ NCGR 32x64 4bpp, two frames) ---
