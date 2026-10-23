@@ -8,6 +8,7 @@
 #include "HGTCamera.h"
 #include "EmuInstance.h"
 #include "NDS.h"
+#include "Savestate.h"
 #include "GPU.h"
 #include "Config.h"
 #include "net/MPInterface.h"
@@ -76,13 +77,14 @@ std::mutex inviteMx; HGTogether::InviteStatus invitePub;   // kopie voor het doc
 const uint32_t kFlagsBlk = 0x170 * 2 + 2912 / 8, kTempVarBytes = 0x20 * 2;
 std::vector<u8> storySnap, storyPending; int storyState = 0; uint32_t storyIdle = 0;
 // LEARNLOG van de EXPJ-cave (bench/hgtpatch.py): u32 aantal, 8x {u16 soort, u16 zet (|0x8000 = slots vol, overgeslagen)}
-// Wegvallen tijdens een co-op-battle: elke 30 frames een HGTH-hartslag (ook in de battle, posities gaan alleen in de
-// overworld). START zet de foutdetectie van de link uit; hoort de fork 5 s niets terwijl HGT.active = 1 (battle loopt),
-// dan zet hij battleOutcomeFlag (BattleSystem+0x2420) op 2 = verloren: BattleContext_Main springt naar het einde, daarna
-// het gewone verliespad (COPY, sluiten, whiteout). Zonder hartslag van de ander (oudere build) doet de bewaker niets.
-// STAND 2026-10-21: werkt nog niet (een ander foutpad toont na ~20 s toch het comm-error-scherm, en de vlag brak de
-// battle-intro niet af), daarom alleen met HGT_ABORT_ON_SILENCE=1. De hartslag zelf is onschuldig en blijft aan.
-uint32_t peerHeard = 0; bool battleAborted = false;
+// Wegvallen tijdens een co-op-battle: elke 30 frames een HGTH-hartslag (ook in de battle; posities gaan alleen in de
+// overworld). Een link-battle kan zonder de ander niet netjes eindigen (alle battler-berichten lopen via de verbinding;
+// afbreken via battleOutcomeFlag of de battle-proc liet de battle hangen of crashte daarna in de heap), en het spel zelf
+// kent alleen comm-error -> reset. Daarom emulator-side: vlak vóór de co-op (leader: "samen" beslist, joiner: HGTG
+// ontvangen) een savestate in het geheugen; is de ander daarna kDropFrames stil zolang de co-op loopt, dan die state
+// terug (en HGTX naar de ander, die dan hetzelfde doet). Leader: beslissing 2 -> WAIT start de originele TrainerBattle
+// solo; joiner: staat weer waar hij was.
+const uint32_t kDropFrames = 4 * 60; uint32_t peerHeard = 0, snapFrame = 0; int snapRole = 0; bool snapSeenActive = false; std::vector<u8> preBattle;
 const uint32_t kLearnLog = 0x02078D00; std::mutex learnMx; std::vector<HGTogether::LearnNotice> learnNotices;
 // Is de hook er echt (scriptcommando 213 -> onze TB-cave)? Zonder hook (ongepatchte ROM/andere states) staat op kSignal
 // gewone code: die niet als sein lezen en ook geen joiner-script injecteren (9019 bestaat dan niet).
@@ -396,6 +398,24 @@ void logBattle(NDS& nds)
             nds.ARM9Read32(setup + 0x18), nds.ARM9Read32(setup + 0x1C), nds.ARM9Read32(setup + 0x20), nds.ARM9Read32(setup + 0x24), nds.ARM9Read8(setup + 0x1B2));
 }
 
+void takePreBattle(NDS& nds, int role)
+{
+    Savestate st; nds.DoSavestate(&st);
+    if (st.Error) { fprintf(stderr, "HGT: snapshot voor de co-op MISLUKT\n"); return; }
+    preBattle.assign((const u8*)st.Buffer(), (const u8*)st.Buffer() + st.Length());
+    snapRole = role; snapFrame = frame; snapSeenActive = false; peerHeard = frame;
+    fprintf(stderr, "HGT: snapshot voor de co-op (%zu KB)\n", preBattle.size() / 1024);
+}
+
+void restorePreBattle(NDS& nds, uint32_t silent)
+{
+    Savestate st(preBattle.data(), (u32)preBattle.size(), false);
+    bool ok = nds.DoSavestate(&st) && !st.Error;
+    fprintf(stderr, "HGT: de ander is weg (%u s stil) midden in de co-op -> terug naar vóór de battle %s\n", silent / 60, ok ? (snapRole == 1 ? "(trainer solo)" : "") : "MISLUKT");
+    if (ok && snapRole == 1) { nds.ARM9Write32(kDecision, 2); storyStartAt(nds, 3); }   // WAIT -> originele TrainerBattle; story-sync als bij solo
+    inv = InviteRun{}; clubRole = 0; autoKeyFrames = 0; snapRole = 0; preBattle.clear();
+}
+
 void HGTogether::tick(EmuInstance* emu)
 {
     if (!initDone) init();
@@ -414,7 +434,7 @@ void HGTogether::tick(EmuInstance* emu)
     auto decide = [&](bool together) {   // leader: beslissing naar de ROM (WAIT start de club of de solo-battle) en naar de ander
         nds.ARM9Write32(kDecision, together ? 1 : 2); send(together ? "HGTG" : "HGTS", inv.trainer);
         fprintf(stderr, "HGT: uitnodiging trainer %u -> %s\n", inv.trainer, together ? "SAMEN (2v2)" : "solo");
-        if (together) { clubRole = 1; clubUntil = frame + kClubFrames; }
+        if (together) { clubRole = 1; clubUntil = frame + kClubFrames; takePreBattle(nds, 1); }
         storyStart(together ? 1 : 3);
         finish(together ? 2 : 3); };
     bool online = !peers.empty() && frame - peers[0].seen < kPeerTimeout;
@@ -431,14 +451,14 @@ void HGTogether::tick(EmuInstance* emu)
     }
     if (frame % 30 == 0) send("HGTH", 0);
     for (const BattleMsg& m : netMsgs) if (!memcmp(m.tag, "HGTH", 4)) peerHeard = frame;
-    static const bool abortOnSilence = [] { const char* e = getenv("HGT_ABORT_ON_SILENCE"); return e && *e && *e != '0'; }();   // experiment, standaard uit
-    if (abortOnSilence && hook && nds.ARM9Read32(kSignal + 20) == 1 && peerHeard && frame - peerHeard > 300 && !battleAborted)
+    if (snapRole)   // co-op loopt (snapshot vlak ervoor): klaar = COPY heeft HGT.active weer op 0 gezet; leader zonder co-op (club mislukt -> WAIT solo) = beslissing 0
     {
-        uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0, pm = inRam(fs) ? nds.ARM9Read32(fs) : 0;
-        uint32_t child = inRam(pm) ? nds.ARM9Read32(pm + 4) : 0, bsys = inRam(child) ? nds.ARM9Read32(child + 0x1C) : 0;
-        if (inRam(bsys)) { nds.ARM9Write8(bsys + 0x2420, 2); battleAborted = true; fprintf(stderr, "HGT: de ander is weg (%u s stil) -> battle afgebroken als verloren\n", (frame - peerHeard) / 60); }
+        uint32_t active = nds.ARM9Read32(kSignal + 20);
+        if (active == 1) snapSeenActive = true;
+        if ((snapSeenActive && active != 1) || (snapRole == 1 && nds.ARM9Read32(kDecision) == 0) || frame - snapFrame > 120 * 60) { snapRole = 0; preBattle.clear(); }
+        else if (frame - peerHeard > kDropFrames) { send("HGTX", 0); restorePreBattle(nds, frame - peerHeard); }   // HGTX: was het alleen een hapering, dan stopt de ander ook (anders comm-error daar)
+        else for (const BattleMsg& m : netMsgs) if (!memcmp(m.tag, "HGTX", 4)) { restorePreBattle(nds, 0); break; }
     }
-    if (nds.ARM9Read32(kSignal + 20) != 1) battleAborted = false;
     for (const BattleMsg& m : netMsgs)
     {
         if (!memcmp(m.tag, "HGTB", 4)) { if (hook && inv.role == 0) { inv = InviteRun{}; inv.role = 2; inv.trainer = m.trainer; inv.until = frame + kInviteFrames;
@@ -446,7 +466,7 @@ void HGTogether::tick(EmuInstance* emu)
         else if (inv.role == 1 && inv.phase <= 1 && !memcmp(m.tag, "HGTA", 4)) inv.theirs = true;
         else if (inv.role == 1 && inv.phase <= 1 && !memcmp(m.tag, "HGTD", 4)) decide(false);
         else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTS", 4)) finish(3);
-        else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTG", 4)) { peerBattle = m; peerBattleSeen = frame; finish(2); }   // join hieronder
+        else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTG", 4)) { peerBattle = m; peerBattleSeen = frame; finish(2); takePreBattle(nds, 2); }   // join hieronder
     }
     netMsgs.clear();
     int ans = guiAnswer.exchange(-1);
