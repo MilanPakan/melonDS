@@ -44,7 +44,7 @@ using namespace melonDS;
 
 namespace
 {
-const uint32_t kFieldSysLiteral = 0x0203E304, kTaskWild = 0x02050C18, kTaskEncounter = 0x02050738, kMapHeaders = 0x020F6BE0;
+const uint32_t kFieldSysLiteral = 0x0203E304, kTaskWild = 0x02050C18, kTaskEncounter = 0x02050738, kTaskSafari = 0x02050D1C, kTaskBugContest = 0x02050EB8, kMapHeaders = 0x020F6BE0;
 const int kMapsecLeague = 15, kMapsecIndigo = 147;   // pret constants/map_sections.h: binnen de League vervalt de E4-cap
 enum { PENDING, CAUGHT, MISSED, REROLL };
 struct Enc { int32_t area; uint16_t species; uint32_t pid; uint8_t outcome; int64_t ts; };
@@ -356,14 +356,15 @@ void bagRestore(NDS& nds)   // aanroep alleen in de overworld: saveData is dan n
     nzlog("tas: items terug");
 }
 
-// --- encounter-watcher: taakketen FS+0x10 -> prev; Task_WildEncounter/Task_StartEncounter hebben env+0x10 = BattleSetup ---
+// --- encounter-watcher: taakketen FS+0x10 -> prev; Task_Wild/Safari/BugContestEncounter en Task_StartEncounter hebben env+0x10 = BattleSetup
+//     (Safari en Bug Contest zijn wilde encounters met een eigen taak; zonder deze twee waren vangsten daar een vrije "gift") ---
 uint32_t encounterSetup(NDS& nds, uint32_t fs)
 {
     uint32_t t = nds.ARM9Read32(fs + 0x10);
     for (int i = 0; inRam(t) && i < 8; i++, t = nds.ARM9Read32(t))
     {
         uint32_t func = nds.ARM9Read32(t + 4) & ~1u;
-        if (func == kTaskWild || func == kTaskEncounter) { uint32_t s = nds.ARM9Read32(nds.ARM9Read32(t + 0xC) + 0x10); return inRam(s) ? s : 0; }
+        if (func == kTaskWild || func == kTaskEncounter || func == kTaskSafari || func == kTaskBugContest) { uint32_t s = nds.ARM9Read32(nds.ARM9Read32(t + 0xC) + 0x10); return inRam(s) ? s : 0; }
     }
     return 0;
 }
