@@ -104,6 +104,16 @@ void storyStartAt(NDS& nds, int state)   // kopie van vars/flags; 1 = co-op (wac
     uint32_t fb = flagsBlock(nds); storySnap.clear(); storyState = 0;
     if (fb) { for (uint32_t i = 0; i < kFlagsBlk; i++) storySnap.push_back(nds.ARM9Read8(fb + i)); storyState = state; }
 }
+// Co-op alleen tegen bazen (Milan 2026-10-24): trainerklasse (byte 1 in trdata a/0/5/5, pokeheartgold trainer_class.h)
+// Rival, gymleiders (ook Blue), Elite Four, Champion Lance, Rocket-executives; rematches hebben dezelfde klasse. Rest solo.
+HGTGhost::Narc trdata;
+bool isBoss(uint32_t t)
+{
+    static const uint8_t kBoss[] = { 23, 66, 67, 70, 72, 73, 74, 75, 76, 98, 103, 104, 105, 106, 107, 108, 110, 87, 88, 89, 112, 86, 114, 116, 117, 118 };
+    uint32_t len = 0; const uint8_t* d = trdata.file((int)t, len); if (!d || len < 2) return false;
+    for (uint8_t c : kBoss) if (d[1] == c) return true;
+    return false;
+}
 bool hookOn(NDS& nds) { uint32_t tb = nds.ARM9Read32(kCmd213); return tb > kCaveLo && tb < kCaveHi; }
 // Club-UI automatisch: na het sein (leader) of de injectie (joiner) elke 40 frames A, tot de club verbonden is,
 // maximaal kClubFrames.
@@ -421,7 +431,12 @@ void HGTogether::tick(EmuInstance* emu)
     if (!initDone) init();
     if (!enabled || !emu->nds) return;
     frame++;
-    if (frame == 1) { startLan(emu); HGTGhost::init(emu->baseROMDir + "/" + emu->baseROMName); }
+    if (frame == 1)
+    {
+        startLan(emu); HGTGhost::init(emu->baseROMDir + "/" + emu->baseROMName);
+        trdata.load(QString::fromStdString(emu->baseROMDir + "/" + emu->baseROMName), {"a", "0", "5", "5"});
+        fprintf(stderr, "HGT: trainerdata %s (%zu trainers)\n", trdata.data.empty() ? "NIET geladen: alle trainers solo" : "geladen", trdata.fat.size());
+    }
     if (frame == 2) if (const char* st = getenv("HGT_LOADSTATE")) if (*st) fprintf(stderr, "HGT: savestate %s %s\n", st, emu->loadState(st) ? "geladen" : "MISLUKT");
     NDS& nds = *emu->nds;
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
@@ -442,7 +457,9 @@ void HGTogether::tick(EmuInstance* emu)
     uint32_t t = hook ? nds.ARM9Read32(kSignal) : 0;
     if (t & 0x80000000u)   // ROM: solo-battle zonder uitnodiging (trainer met 1 Pokémon): alleen story-sync
     { nds.ARM9Write32(kSignal, 0); fprintf(stderr, "HGT: trainerbattle %u solo (1 Pokémon)\n", t & 0x7FFFFFFF); storyStart(3); t = 0; }
-    if (t)   // ROM-hook: trainerbattle, WAIT wacht op de beslissing
+    if (t && !isBoss(t))   // gewone trainer: solo zonder uitnodiging (WAIT -> originele TrainerBattle), story-sync als bij solo
+    { nds.ARM9Write32(kSignal, 0); nds.ARM9Write32(kDecision, 2); fprintf(stderr, "HGT: trainerbattle %u solo (geen baas)\n", t); storyStart(3); t = 0; }
+    if (t)   // ROM-hook: trainerbattle van een baas, WAIT wacht op de beslissing
     {
         nds.ARM9Write32(kSignal, 0);
         inv = InviteRun{}; inv.role = 1; inv.trainer = t; inv.until = frame + kInviteFrames;
