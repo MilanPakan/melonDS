@@ -323,9 +323,9 @@ std::vector<HGTogether::PeerStatus> HGTogether::peerStatus()
 }
 
 // Ghost-menu (doel A, Milan 2026-10-24): A terwijl je recht naar de ghost van de ander kijkt (HGTGhost::facingPeer) -> menu
-// Battle / Cancel (Trade volgt: ruilen loopt via de Union Room); een keuze gaat als HGTQ (1 ruilen, 2 vechten) naar de ander, die A = ja / B = nee krijgt (HGTY/HGTN
+// Trade / Battle / Cancel; een keuze gaat als HGTQ (1 ruilen, 2 vechten) naar de ander, die A = ja / B = nee krijgt (HGTY/HGTN
 // terug); geen antwoord binnen kInviteFrames = nee. Zolang menu of vraag open is ziet het spel geen toetsen (speler staat stil).
-// Vechten na "ja": startLink. shortcut: ruilen start nog niets (alleen de melding), Union Room-ruil vanuit het veld volgt.
+// Na "ja": startLink (ruilen en vechten).
 struct GhostMenu { int state = 0, sel = 0, kind = 0; uint32_t until = 0; std::string peer; } gm;   // state 0 dicht, 1 menu, 2 ik wacht, 3 de ander vraagt
 std::string gmNote; uint32_t gmNoteUntil = 0; int facingIdx = -1; u32 lastKeys = 0xFFF; bool glScreen = false;
 const char* kKind[3] = { "", "trade", "battle" };
@@ -339,16 +339,23 @@ void gmSay(EmuInstance* emu, const std::string& text)   // korte melding onder h
     gmNote = text; gmNoteUntil = frame + 180; fprintf(stderr, "HGT: ghost-menu: %s\n", text.c_str());
     if (glScreen) emu->osdAddMessage(0, "%s", text.c_str());
 }
-// PvP: club-script 9018 (LEADER, de vrager) / 9019 (JOINER) via de mailbox, club-UI automatisch zoals bij de co-op; HGT.trainer = 0
-// laat START (bench/hgtpatch.py) naar de originele sub_02051598 gaan = gewone Colosseum-battle (single), HGT.done = 0 voor de club-check.
-void startLink(EmuInstance* emu, NDS& nds, bool leader)
+// Club-script via de mailbox, club-UI automatisch zoals bij de co-op. Vechten: 9018 (LEADER, de vrager) / 9019 (JOINER); HGT.trainer = 0
+// laat START (bench/hgtpatch.py) naar de originele sub_02051598 gaan = gewone Colosseum-battle (single). Ruilen: 9023/9024, na de
+// club het ruilscherm van de Union Room (ScrCmd_161, bench/hgtscript.py). HGT.done = 0 voor de club-check.
+int partyCount(NDS& nds)   // eigen party (save-blok 2, zoals launcher/win/trade-pair.py), -1 = onbekend
+{
+    uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0, sd = inRam(fs) ? nds.ARM9Read32(fs + 0xC) : 0;
+    if (!inRam(sd) || nds.ARM9Read32(sd + 0x23014 + 0x20) != 2) return -1;
+    return (int)nds.ARM9Read32(sd + 0x10 + nds.ARM9Read32(sd + 0x23014 + 0x28) + 4);
+}
+void startLink(EmuInstance* emu, NDS& nds, bool leader, int kind)
 {
     uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0;
     if (!inRam(fs) || !hookOn(nds) || call.active || call.pending) { gmSay(emu, "Can't start the battle here"); return; }
     nds.ARM9Write32(kSignal - 4, 0); nds.ARM9Write32(kSignal + 4, 0);
-    call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = leader ? 9018 : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true;
+    call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = (kind == 1 ? 9023 : 9018) + !leader; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true;
     clubRole = leader ? 1 : 2; clubUntil = frame + kClubFrames;
-    fprintf(stderr, "HGT: ghost-menu: PvP-battle, club-script %u\n", call.a[1]);
+    fprintf(stderr, "HGT: ghost-menu: %s, club-script %u\n", kKind[kind], call.a[1]);
 }
 bool menuInput(EmuInstance* emu, NDS& nds, u32 keys)   // keys actief laag (bit 0 A, 1 B, 6 omhoog, 7 omlaag); true = toetsen opgeslokt
 {
@@ -362,19 +369,22 @@ bool menuInput(EmuInstance* emu, NDS& nds, u32 keys)   // keys actief laag (bit 
     }
     if (gm.state == 1)
     {
-        if (down & 192) gm.sel ^= 1;   // 0 Battle, 1 Cancel
-        if (glScreen && (down & 192)) emu->osdAddMessage(0, "> %s", gm.sel ? "Cancel" : "Battle");
-        if ((down & 2) || ((down & 1) && gm.sel == 1)) { gm.state = 0; fprintf(stderr, "HGT: ghost-menu dicht\n"); }
+        if (down & 64) gm.sel = (gm.sel + 2) % 3;
+        if (down & 128) gm.sel = (gm.sel + 1) % 3;
+        if (glScreen && (down & 192)) emu->osdAddMessage(0, "> %s", gm.sel == 2 ? "Cancel" : gm.sel ? "Battle" : "Trade");
+        if ((down & 2) || ((down & 1) && gm.sel == 2)) { gm.state = 0; fprintf(stderr, "HGT: ghost-menu dicht\n"); }
+        else if ((down & 1) && gm.sel == 0 && partyCount(nds) < 2) { gm.state = 0; gmSay(emu, "You need 2 Pokemon to trade"); }
         else if (down & 1)
         {
-            gm.kind = 2; gm.state = 2; gm.until = frame + kInviteFrames; sendMsg("HGTQ", gm.kind);
+            gm.kind = gm.sel + 1; gm.state = 2; gm.until = frame + kInviteFrames; sendMsg("HGTQ", gm.kind);
             gmSay(emu, "Asked " + gm.peer + " to " + kKind[gm.kind] + "...");
         }
         return true;
     }
     if (gm.state == 3)
     {
-        if (down & 3) { bool yes = down & 1; sendMsg(yes ? "HGTY" : "HGTN", gm.kind); gm.state = 0; gmSay(emu, yes ? std::string("OK, ") + kKind[gm.kind] + " with " + gm.peer : "Said no to " + gm.peer); if (yes && gm.kind == 2) startLink(emu, nds, false); }
+        if ((down & 1) && gm.kind == 1 && partyCount(nds) < 2) { sendMsg("HGTN", gm.kind); gm.state = 0; gmSay(emu, "You need 2 Pokemon to trade"); }
+        else if (down & 3) { bool yes = down & 1; sendMsg(yes ? "HGTY" : "HGTN", gm.kind); gm.state = 0; gmSay(emu, yes ? std::string("OK, ") + kKind[gm.kind] + " with " + gm.peer : "Said no to " + gm.peer); if (yes) startLink(emu, nds, false, gm.kind); }
         return true;
     }
     return true;   // state 2: wachten op het antwoord
@@ -394,7 +404,7 @@ void menuTick(EmuInstance* emu, NDS& nds)   // na exchange: wie staat recht voor
             gm.peer = peers.empty() ? std::string("friend") : std::string(peers[0].st.info.name, strnlen(peers[0].st.info.name, 8));
             gmSay(emu, gm.peer + " wants to " + kKind[gm.kind] + ". A = yes, B = no");
         }
-        else if (gm.state == 2 && !memcmp(m.tag, "HGTY", 4)) { gm.state = 0; gmSay(emu, gm.peer + " said yes: " + kKind[gm.kind]); if (gm.kind == 2) startLink(emu, nds, true); }
+        else if (gm.state == 2 && !memcmp(m.tag, "HGTY", 4)) { gm.state = 0; gmSay(emu, gm.peer + " said yes: " + kKind[gm.kind]); startLink(emu, nds, true, gm.kind); }
         else if (gm.state == 2 && !memcmp(m.tag, "HGTN", 4)) { gm.state = 0; gmSay(emu, gm.peer + " said no"); }
     }
     if (gm.state >= 2 && frame >= gm.until) { if (gm.state == 3) sendMsg("HGTN", gm.kind); gm.state = 0; gmSay(emu, "No answer from " + gm.peer); }
@@ -405,7 +415,7 @@ void menuDraw(void* top)   // software-renderer: menu/vraag/melding rechtsboven 
     QImage img((uchar*)top, 256, 192, QImage::Format_RGB32); QPainter g(&img);
     QFont f = g.font(); f.setPixelSize(10); g.setFont(f);
     QStringList lines;
-    if (gm.state == 1) for (int i = 0; i < 2; i++) lines << QString("%1 %2").arg(i == gm.sel ? ">" : " ", i ? "Cancel" : "Battle");
+    if (gm.state == 1) for (int i = 0; i < 3; i++) lines << QString("%1 %2").arg(i == gm.sel ? ">" : " ", i == 2 ? "Cancel" : i ? "Battle" : "Trade");
     else if (gm.state == 2) lines << QString("Waiting for %1...").arg(QString::fromStdString(gm.peer)) << "(B: wait it out)";
     else if (gm.state == 3) lines << QString("%1 wants to %2.").arg(QString::fromStdString(gm.peer), kKind[gm.kind]) << "A = yes   B = no";
     else lines << QString::fromStdString(gmNote);
