@@ -54,7 +54,7 @@ bool enabled = false, initDone = false;
 int sock = -1;
 sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
 State me{};
-struct Peer { sockaddr_storage addr; socklen_t len; State st; uint32_t seen; };
+struct Peer { sockaddr_storage addr; socklen_t len; State st; uint32_t seen; bool logged; };   // logged: laatst gelogde verbonden-stand (launcher-status leest die regels)
 std::vector<Peer> peers;                                   // iedereen van wie we een positiepakket kregen
 std::vector<std::pair<sockaddr_storage, socklen_t>> sendTo;   // alle HGT_PEER-adressen (komma-gescheiden); peerAddr = de eerste (battle-sein)
 // Co-op trainerbattle (bench/hgtpatch.py): de ROM-hook zet HGT.signal = trainerId op kSignal; wij sturen dat als
@@ -168,7 +168,7 @@ void exchange(bool send = true)
         if (n == (int)sizeof(State))
         {
             Peer* p = nullptr; for (auto& q : peers) if (q.len == fromLen && !memcmp(&q.addr, &from, fromLen)) p = &q;
-            if (!p) { peers.push_back({from, fromLen, {}, 0}); p = &peers.back(); }
+            if (!p) { peers.push_back({from, fromLen, {}, 0, false}); p = &peers.back(); }
             memcpy(&p->st, buf, sizeof(State)); p->seen = frame;
         }
         else if (n == (int)sizeof(BattleMsg) && memcmp(buf, "HGT", 3) == 0) { BattleMsg m; memcpy(&m, buf, sizeof(m)); netMsgs.push_back(m); }
@@ -564,6 +564,8 @@ void HGTogether::tick(EmuInstance* emu)
     HGTCamera::apply(nds);   // camera-experiment (HGT_CAM), vóór de ghost zodat die dezelfde camera leest
     bool haveMe = readState(nds, me); me.frame = frame;
     exchange(haveMe);   // ook zonder eigen positie ontvangen (uitnodiging tijdens een menu)
+    for (Peer& p : peers)
+        if ((frame - p.seen < kPeerTimeout) != p.logged) { p.logged = !p.logged; fprintf(stderr, "HGT: vriend %.8s %s\n", p.st.info.name, p.logged ? "verbonden" : "weg"); }
     void* top = nullptr; void* bottom = nullptr;
     bool cpu = nds.GPU.GetFramebuffers(&top, &bottom); if (!top) return;   // false = OpenGL: top = &GLuint van de uitvoertextuur
     if (haveMe) drawGhosts(top, cpu, nds);
