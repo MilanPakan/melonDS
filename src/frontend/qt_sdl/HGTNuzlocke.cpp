@@ -60,7 +60,7 @@ std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-th
 // calm: ARM9 wacht op vblank (spel niet midden in zijn werk)
 int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false, calm = false, partyDue = false; uint32_t calmTicks = 0, allTicks = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
 std::vector<uint32_t> pendingDead; uint32_t linkSetup = 0, tid = 0;   // tid: trainer-ID+secret-ID van de run (anders = New Game)   // doden in een linkbattle (co-op): pas definitief als die normaal eindigt
-bool curEligible = false; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
+bool curEligible = false; const char* curReason = ""; uint16_t curSpecies = 0; uint32_t nickCheck = 0, nickRemind = 0; uint16_t nickSpecies = 0; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
 bool inRam(uint32_t a) { return a >= 0x02000000 && a < 0x02400000; }
@@ -246,6 +246,8 @@ void save()
     dirty = false; if (jsonPath.empty()) return;
     QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}, {"soullink", soulLink != 0}, {"tid", (qint64)tid}};
     if (me.starterSpecies && peer.starterSpecies) o["sameStarter"] = family(me.starterSpecies) == family(peer.starterSpecies);   // dock: "jullie hebben dezelfde starter"
+    if (nickRemind) o["nick"] = QJsonObject{{"pid", (qint64)nickRemind}, {"species", nickSpecies}};   // dock: herinnering tot een bijnaam of de volgende encounter
+    if (curSetup) o["cur"] = QJsonObject{{"area", curArea}, {"species", curSpecies}, {"catch", curEligible}, {"reason", curReason}};   // lopende wilde encounter (dock)
     if (peerStarter >= 0) { o["peerStarter"] = peerStarter.load(); o["starterMismatch"] = peerStarter != starterFirst; }
     QFile f(QString::fromStdString(jsonPath)); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(o).toJson());
 }
@@ -335,6 +337,7 @@ void init(const std::string& rom)
 
 // --- bag: pockets items/medicine/berries/battle items (pret bag_types_def.h, 4 bytes per slot) ---
 const struct { uint32_t off, n; } kBlocked[] = {{0, 165}, {0x520, 40}, {0x5C0, 64}, {0x720, 30}};
+const uint32_t kBalls = 0x6C0, kBallsLen = 24 * 4; uint8_t ballSnap[kBallsLen]; bool ballsHeld = false;   // Balls-pocket: alleen weg als de encounter niet telt
 bool bagOk(NDS& nds) { return saveData && nds.ARM9Read32(saveData + 0x23014 + 3 * 0x10) == 3; }   // blok-header 3 = BAG
 void bagHide(NDS& nds, uint32_t setup)
 {
@@ -349,14 +352,20 @@ void bagHide(NDS& nds, uint32_t setup)
         bagHeld = true; bagSnapSD = saveData; nzlog("tas: items verborgen voor de battle");
     }
     for (auto& p : kBlocked) for (uint32_t i = 0; i < p.n * 4; i++) if (nds.ARM9Read8(copy + p.off + i)) nds.ARM9Write8(copy + p.off + i, 0);
+    if (setup == curSetup && !curEligible)   // area al gebruikt / dupe: vangen kan dan niet eens
+    {
+        if (!ballsHeld) { uint32_t bag = saveArray(nds, 3); for (uint32_t i = 0; i < kBallsLen; i++) ballSnap[i] = nds.ARM9Read8(bag + kBalls + i); ballsHeld = true; nzlog("tas: Balls verborgen (%s)", curReason); }
+        for (uint32_t i = 0; i < kBallsLen; i++) if (nds.ARM9Read8(copy + kBalls + i)) nds.ARM9Write8(copy + kBalls + i, 0);
+    }
     bagHidden = setup;
 }
 void bagRestore(NDS& nds)   // aanroep alleen in de overworld: saveData is dan net uit het FieldSystem gelezen
 {
-    bagHeld = false; bagHidden = bagCopy = 0;
+    bagHeld = false; bagHidden = bagCopy = 0; bool balls = ballsHeld; ballsHeld = false;
     if (!bagOk(nds) || saveData != bagSnapSD) { nzlog("tas: SaveData anders dan bij het verbergen (%08X, was %08X) of blok 3 klopt niet: items NIET teruggezet", saveData, bagSnapSD); return; }
     uint32_t bag = saveArray(nds, 3); for (auto& p : kBlocked) for (uint32_t i = 0; i < p.n * 4; i++) nds.ARM9Write8(bag + p.off + i, bagSnap[p.off + i]);
-    nzlog("tas: items terug");
+    if (balls) for (uint32_t i = 0; i < kBallsLen; i++) nds.ARM9Write8(bag + kBalls + i, ballSnap[i]);   // alleen als ze verborgen waren: anders kwam een gegooide bal terug
+    nzlog("tas: items terug%s", balls ? " (ook de Balls)" : "");
 }
 
 // --- encounter-watcher: taakketen FS+0x10 -> prev; Task_Wild/Safari/BugContestEncounter en Task_StartEncounter hebben env+0x10 = BattleSetup
@@ -376,6 +385,7 @@ void finish(uint32_t winFlag)   // winFlag: 1 win, 2 lose, 4 gevangen, 5 gevluch
 {
     Enc* e = findEnc(me, curArea); bool caught = winFlag == 4;
     if (caught && !curEligible) me.banned.push_back(curPid);   // dupe / tweede vangst in de area: moet weg
+    if (caught && curEligible) nickCheck = curPid;   // bijnaam pas controleren als hij in de party staat
     if (e && e->outcome == PENDING) e->outcome = caught ? CAUGHT : MISSED;
     nzlog("encounter klaar area %d winFlag %u -> %s%s", curArea, winFlag, caught ? "gevangen" : "geen vangst", caught && !curEligible ? " (VERBODEN, gaat naar de box)" : "");
     curSetup = 0; dirty = true;
@@ -424,13 +434,13 @@ void watchEncounter(NDS& nds, uint32_t fs)
     }
     if (nds.ARM9Read32(setup) & 1) { doneSetup = setup; return; }   // trainerbattle: geen Nuzlocke-encounter
     uint32_t enemy = nds.ARM9Read32(setup + 8); Mon wild; if (!inRam(enemy) || !readMon(nds, enemy + 8, wild)) return;
-    curSetup = setup; curPid = wild.pid; curArea = (int32_t)nds.ARM9Read32(setup + 0x154);
+    curSetup = setup; curPid = wild.pid; curArea = (int32_t)nds.ARM9Read32(setup + 0x154); curSpecies = wild.species; nickRemind = nickCheck = 0;
     Enc* e = findEnc(me, curArea);
-    if (e && e->outcome != REROLL && e->outcome != PENDING) { curEligible = false; nzlog("encounter area %d soort %u: area al gebruikt, telt niet", curArea, wild.species); return; }
+    if (e && e->outcome != REROLL && e->outcome != PENDING) { curEligible = false; curReason = "used"; dirty = true; nzlog("encounter area %d soort %u: area al gebruikt, telt niet", curArea, wild.species); return; }
     bool dupe = owned(wild.species), second = firstPicker(curArea) != myIdx;
     if (!e) { me.encs.push_back({curArea, wild.species, wild.pid, PENDING, now()}); e = &me.encs.back(); }
     e->species = wild.species; e->pid = wild.pid; e->outcome = (dupe && second) ? REROLL : PENDING;
-    curEligible = !dupe; dirty = true;
+    curEligible = !dupe; curReason = dupe ? (second ? "reroll" : "dupe") : "ok"; dirty = true;
     nzlog("encounter area %d soort %u Lv%u (speler %d kiest hier eerst, ik ben %d): %s", curArea, wild.species, wild.level, firstPicker(curArea), myIdx,
           dupe ? (second ? "dupe, reroll toegestaan (vluchten)" : "dupe, niet vangen") : "eerste encounter, vangen mag");
 }
@@ -485,9 +495,11 @@ void watchParty(NDS& nds, uint32_t fs, bool idle)
     static bool sameWarned = false;
     if (!sameWarned && me.starterSpecies && peer.starterSpecies && family(me.starterSpecies) == family(peer.starterSpecies))
     { sameWarned = true; nzlog("ZELFDE STARTER: jij en de vriend hebben allebei soort %u (familie %u); starters vallen buiten de dupes-regel, er wordt niets geboxt", me.starterSpecies, family(me.starterSpecies)); }
-    static std::vector<uint32_t> nickWarned;   // verplichte nickname: één melding per Pokémon per sessie (naam geven: Name Rater, Goldenrod)
-    for (uint32_t i = 0; i < cur; i++)
-        if (!mons[i].egg && !mons[i].nicked && !has(nickWarned, mons[i].pid)) { nickWarned.push_back(mons[i].pid); nzlog("NICKNAME VERPLICHT: soort %u pid %08X heeft geen bijnaam", mons[i].species, mons[i].pid); }
+    for (uint32_t i = 0; i < cur; i++)   // bijnaam (Milan: herinnering, geen dwang): één keer, direct na de vangst; weg bij een bijnaam (Name Rater)
+    {
+        if (mons[i].pid == nickCheck) { nickCheck = 0; if (!mons[i].nicked) { nickRemind = mons[i].pid; nickSpecies = mons[i].species; dirty = true; nzlog("NICKNAME VERPLICHT: soort %u pid %08X heeft geen bijnaam", mons[i].species, mons[i].pid); } }
+        if (mons[i].pid == nickRemind && mons[i].nicked) { nickRemind = 0; dirty = true; }
+    }
     for (uint32_t i = 0; i < cur; i++)
         if (mons[i].hp == 0 && !mons[i].egg && !corrupt(mons[i]) && !has(me.dead, mons[i].pid)) { me.dead.push_back(mons[i].pid); dirty = true; nzlog("DOOD: soort %u Lv%u pid %08X", mons[i].species, mons[i].level, mons[i].pid); }
     if (!idle) return;
