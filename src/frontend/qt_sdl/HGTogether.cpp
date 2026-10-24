@@ -13,6 +13,8 @@
 #include "Config.h"
 #include "net/MPInterface.h"
 #include "net/LAN.h"
+#include <QImage>
+#include <QPainter>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -320,11 +322,107 @@ std::vector<HGTogether::PeerStatus> HGTogether::peerStatus()
     return v;
 }
 
+// Ghost-menu (doel A, Milan 2026-10-24): A terwijl je recht naar de ghost van de ander kijkt (HGTGhost::facingPeer) -> menu
+// Battle / Cancel (Trade volgt: ruilen loopt via de Union Room); een keuze gaat als HGTQ (1 ruilen, 2 vechten) naar de ander, die A = ja / B = nee krijgt (HGTY/HGTN
+// terug); geen antwoord binnen kInviteFrames = nee. Zolang menu of vraag open is ziet het spel geen toetsen (speler staat stil).
+// Vechten na "ja": startLink. shortcut: ruilen start nog niets (alleen de melding), Union Room-ruil vanuit het veld volgt.
+struct GhostMenu { int state = 0, sel = 0, kind = 0; uint32_t until = 0; std::string peer; } gm;   // state 0 dicht, 1 menu, 2 ik wacht, 3 de ander vraagt
+std::string gmNote; uint32_t gmNoteUntil = 0; int facingIdx = -1; u32 lastKeys = 0xFFF; bool glScreen = false;
+const char* kKind[3] = { "", "trade", "battle" };
+void sendMsg(const char* tag, uint32_t v)
+{
+    BattleMsg m; memcpy(m.tag, tag, 4); m.trainer = v;
+    for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen);
+}
+void gmSay(EmuInstance* emu, const std::string& text)   // korte melding onder het menu (OpenGL-renderer: via de OSD van melonDS)
+{
+    gmNote = text; gmNoteUntil = frame + 180; fprintf(stderr, "HGT: ghost-menu: %s\n", text.c_str());
+    if (glScreen) emu->osdAddMessage(0, "%s", text.c_str());
+}
+// PvP: club-script 9018 (LEADER, de vrager) / 9019 (JOINER) via de mailbox, club-UI automatisch zoals bij de co-op; HGT.trainer = 0
+// laat START (bench/hgtpatch.py) naar de originele sub_02051598 gaan = gewone Colosseum-battle (single), HGT.done = 0 voor de club-check.
+void startLink(EmuInstance* emu, NDS& nds, bool leader)
+{
+    uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0;
+    if (!inRam(fs) || !hookOn(nds) || call.active || call.pending) { gmSay(emu, "Can't start the battle here"); return; }
+    nds.ARM9Write32(kSignal - 4, 0); nds.ARM9Write32(kSignal + 4, 0);
+    call.addr = 0x0203FE74; call.a[0] = fs; call.a[1] = leader ? 9018 : 9019; call.a[2] = 0; call.a[3] = 0; call.out.clear(); call.pending = true;
+    clubRole = leader ? 1 : 2; clubUntil = frame + kClubFrames;
+    fprintf(stderr, "HGT: ghost-menu: PvP-battle, club-script %u\n", call.a[1]);
+}
+bool menuInput(EmuInstance* emu, NDS& nds, u32 keys)   // keys actief laag (bit 0 A, 1 B, 6 omhoog, 7 omlaag); true = toetsen opgeslokt
+{
+    u32 down = lastKeys & ~keys; lastKeys = keys;
+    if (gm.state == 0)
+    {
+        if (!(down & 1) || facingIdx < 0) return false;
+        gm = GhostMenu{}; gm.state = 1; gm.peer = std::string(peers[facingIdx].st.info.name, strnlen(peers[facingIdx].st.info.name, 8));
+        fprintf(stderr, "HGT: ghost-menu open (%s)\n", gm.peer.c_str()); if (glScreen) emu->osdAddMessage(0, "%s: Up/Down, A = choose, B = back", gm.peer.c_str());
+        return true;
+    }
+    if (gm.state == 1)
+    {
+        if (down & 192) gm.sel ^= 1;   // 0 Battle, 1 Cancel
+        if (glScreen && (down & 192)) emu->osdAddMessage(0, "> %s", gm.sel ? "Cancel" : "Battle");
+        if ((down & 2) || ((down & 1) && gm.sel == 1)) { gm.state = 0; fprintf(stderr, "HGT: ghost-menu dicht\n"); }
+        else if (down & 1)
+        {
+            gm.kind = 2; gm.state = 2; gm.until = frame + kInviteFrames; sendMsg("HGTQ", gm.kind);
+            gmSay(emu, "Asked " + gm.peer + " to " + kKind[gm.kind] + "...");
+        }
+        return true;
+    }
+    if (gm.state == 3)
+    {
+        if (down & 3) { bool yes = down & 1; sendMsg(yes ? "HGTY" : "HGTN", gm.kind); gm.state = 0; gmSay(emu, yes ? std::string("OK, ") + kKind[gm.kind] + " with " + gm.peer : "Said no to " + gm.peer); if (yes && gm.kind == 2) startLink(emu, nds, false); }
+        return true;
+    }
+    return true;   // state 2: wachten op het antwoord
+}
+void menuTick(EmuInstance* emu, NDS& nds)   // na exchange: wie staat recht voor mij, berichten van de ander, time-out
+{
+    facingIdx = -1;
+    for (size_t i = 0; i < peers.size(); i++)
+        if (peers[i].st.mapId == me.mapId && frame - peers[i].seen < kPeerTimeout && HGTGhost::facingPeer(nds, peers[i].st.x, peers[i].st.z)) facingIdx = (int)i;
+    for (const BattleMsg& m : netMsgs)
+    {
+        if (!memcmp(m.tag, "HGTQ", 4) && m.trainer >= 1 && m.trainer <= 2)
+        {
+            if (gm.state == 3 && gm.kind == (int)m.trainer) continue;   // elk bericht komt 3x (sendMsg)
+            if (gm.state || !HGTGhost::overworld(nds)) { sendMsg("HGTN", m.trainer); continue; }   // bezig: meteen nee
+            gm = GhostMenu{}; gm.state = 3; gm.kind = (int)m.trainer; gm.until = frame + kInviteFrames;
+            gm.peer = peers.empty() ? std::string("friend") : std::string(peers[0].st.info.name, strnlen(peers[0].st.info.name, 8));
+            gmSay(emu, gm.peer + " wants to " + kKind[gm.kind] + ". A = yes, B = no");
+        }
+        else if (gm.state == 2 && !memcmp(m.tag, "HGTY", 4)) { gm.state = 0; gmSay(emu, gm.peer + " said yes: " + kKind[gm.kind]); if (gm.kind == 2) startLink(emu, nds, true); }
+        else if (gm.state == 2 && !memcmp(m.tag, "HGTN", 4)) { gm.state = 0; gmSay(emu, gm.peer + " said no"); }
+    }
+    if (gm.state >= 2 && frame >= gm.until) { if (gm.state == 3) sendMsg("HGTN", gm.kind); gm.state = 0; gmSay(emu, "No answer from " + gm.peer); }
+}
+void menuDraw(void* top)   // software-renderer: menu/vraag/melding rechtsboven op het bovenscherm (BGRA 256x192)
+{
+    if (!gm.state && frame >= gmNoteUntil) return;
+    QImage img((uchar*)top, 256, 192, QImage::Format_RGB32); QPainter g(&img);
+    QFont f = g.font(); f.setPixelSize(10); g.setFont(f);
+    QStringList lines;
+    if (gm.state == 1) for (int i = 0; i < 2; i++) lines << QString("%1 %2").arg(i == gm.sel ? ">" : " ", i ? "Cancel" : "Battle");
+    else if (gm.state == 2) lines << QString("Waiting for %1...").arg(QString::fromStdString(gm.peer)) << "(B: wait it out)";
+    else if (gm.state == 3) lines << QString("%1 wants to %2.").arg(QString::fromStdString(gm.peer), kKind[gm.kind]) << "A = yes   B = no";
+    else lines << QString::fromStdString(gmNote);
+    int w = 0; for (auto& l : lines) w = std::max(w, g.fontMetrics().horizontalAdvance(l));
+    QRect box(256 - w - 18, 4, w + 14, 8 + 12 * (int)lines.size());
+    g.setPen(QPen(QColor(0x30, 0x30, 0x30), 2)); g.setBrush(QColor(0xf8, 0xf8, 0xf8)); g.drawRoundedRect(box, 3, 3);
+    g.setPen(QColor(0x30, 0x30, 0x30));
+    for (int i = 0; i < lines.size(); i++) g.drawText(box.x() + 7, box.y() + 14 + 12 * i, lines[i]);
+}
+
 bool HGTogether::input(EmuInstance* emu)
 {
     if (!emu->nds) return false;
     if (ctlFd == -1) { const char* p = getenv("HGT_CTL"); ctlFd = (p && *p) ? open(p, O_RDONLY | O_NONBLOCK) : -2; if (p && *p) fprintf(stderr, "HGT: ctl %s %s\n", p, ctlFd >= 0 ? "open" : "MISLUKT"); }
-    if (ctlStep(*emu->nds)) return true;   // ook zonder HGT_CTL: ctlStep handelt dan de mailbox-calls af (joiner-injectie)
+    bool scripted = ctlStep(*emu->nds);   // ook zonder HGT_CTL: ctlStep handelt dan de mailbox-calls af (joiner-injectie)
+    if (enabled && menuInput(emu, *emu->nds, scripted ? 0xFFF & ~ctlKeys : emu->inputMask)) { emu->nds->SetKeyMask(0xFFF); emu->nds->ReleaseScreen(); return true; }
+    if (scripted) return true;
     if (!autoKeyFrames) return false;
     autoKeyFrames--; emu->nds->SetKeyMask(0xFFF & ~1u); emu->nds->ReleaseScreen(); return true;   // club-A (zie clubRole)
 }
@@ -443,8 +541,7 @@ void HGTogether::tick(EmuInstance* emu)
     if (frame >= 3) applyPokes(nds);   // na de savestate (frame 2)
     if (frame % 30 == 0) logBattle(nds);
     bool hook = frame > 300 && hookOn(nds);   // pas na de pokes (frame 240+) en alleen als de TB-hook echt in RAM staat
-    auto send = [&](const char* tag, uint32_t tr) { BattleMsg m; memcpy(m.tag, tag, 4); m.trainer = tr;
-        for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen); };
+    auto send = sendMsg;
     auto finish = [&](int phase) { inv.phase = phase; inv.holdUntil = frame + kHoldFrames; };
     auto storyStart = [&](int st) { storyStartAt(nds, st); };
     auto decide = [&](bool together) {   // leader: beslissing naar de ROM (WAIT start de club of de solo-battle) en naar de ander
@@ -484,6 +581,7 @@ void HGTogether::tick(EmuInstance* emu)
         else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTS", 4)) finish(3);
         else if (inv.role == 2 && inv.phase <= 1 && !memcmp(m.tag, "HGTG", 4)) { peerBattle = m; peerBattleSeen = frame; finish(2); takePreBattle(nds, 2); }   // join hieronder
     }
+    menuTick(emu, nds);   // ghost-menu: HGTQ/HGTY/HGTN
     netMsgs.clear();
     int ans = guiAnswer.exchange(-1);
     if (ans >= 0 && inv.role && inv.phase == 0)
@@ -585,6 +683,7 @@ void HGTogether::tick(EmuInstance* emu)
     void* top = nullptr; void* bottom = nullptr;
     bool cpu = nds.GPU.GetFramebuffers(&top, &bottom); if (!top) return;   // false = OpenGL: top = &GLuint van de uitvoertextuur
     if (haveMe) drawGhosts(top, cpu, nds);
+    glScreen = !cpu; if (cpu) menuDraw(top);
     if (!cpu) return;
     u32* fb = (u32*)top;
     if (!dumpDir.empty() && frame % 60 == 0)
