@@ -15,6 +15,7 @@
 #include "net/LAN.h"
 #include <QImage>
 #include <QPainter>
+#include <QDateTime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -327,17 +328,16 @@ std::vector<HGTogether::PeerStatus> HGTogether::peerStatus()
 // terug); geen antwoord binnen kInviteFrames = nee. Zolang menu of vraag open is ziet het spel geen toetsen (speler staat stil).
 // Na "ja": startLink (ruilen en vechten).
 struct GhostMenu { int state = 0, sel = 0, kind = 0; uint32_t until = 0; std::string peer; } gm;   // state 0 dicht, 1 menu, 2 ik wacht, 3 de ander vraagt
-std::string gmNote; uint32_t gmNoteUntil = 0; int facingIdx = -1; u32 lastKeys = 0xFFF; bool glScreen = false;
+std::string gmNote; uint32_t gmNoteUntil = 0; int facingIdx = -1; u32 lastKeys = 0xFFF;
 const char* kKind[3] = { "", "trade", "battle" };
 void sendMsg(const char* tag, uint32_t v)
 {
     BattleMsg m; memcpy(m.tag, tag, 4); m.trainer = v;
     for (int i = 0; i < 3 && peerLen; i++) sendto(sock, (const char*)&m, sizeof(m), 0, (sockaddr*)&peerAddr, peerLen);
 }
-void gmSay(EmuInstance* emu, const std::string& text)   // korte melding onder het menu (OpenGL-renderer: via de OSD van melonDS)
+void gmSay(EmuInstance*, const std::string& text)   // korte melding (menuDraw/menuOsd tonen hem 3 s)
 {
     gmNote = text; gmNoteUntil = frame + 180; fprintf(stderr, "HGT: ghost-menu: %s\n", text.c_str());
-    if (glScreen) emu->osdAddMessage(0, "%s", text.c_str());
 }
 // Club-script via de mailbox, club-UI automatisch zoals bij de co-op. Vechten: 9018 (LEADER, de vrager) / 9019 (JOINER); HGT.trainer = 0
 // laat START (bench/hgtpatch.py) naar de originele sub_02051598 gaan = gewone Colosseum-battle (single). Ruilen: 9023/9024, na de
@@ -347,6 +347,11 @@ int partyCount(NDS& nds)   // eigen party (save-blok 2, zoals launcher/win/trade
     uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0, sd = inRam(fs) ? nds.ARM9Read32(fs + 0xC) : 0;
     if (!inRam(sd) || nds.ARM9Read32(sd + 0x23014 + 0x20) != 2) return -1;
     return (int)nds.ARM9Read32(sd + 0x10 + nds.ARM9Read32(sd + 0x23014 + 0x28) + 4);
+}
+bool fieldIdle(NDS& nds)   // overworld zonder lopende veldtaak/script (FieldSystem+0x10); tussen ruilscherm en animatie draait er even geen app
+{
+    uint32_t var = nds.ARM9Read32(kFieldSysLiteral), fs = inRam(var) ? nds.ARM9Read32(var) : 0;
+    return inRam(fs) && !nds.ARM9Read32(fs + 0x10) && HGTGhost::overworld(nds);
 }
 void startLink(EmuInstance* emu, NDS& nds, bool leader, int kind)
 {
@@ -362,16 +367,15 @@ bool menuInput(EmuInstance* emu, NDS& nds, u32 keys)   // keys actief laag (bit 
     u32 down = lastKeys & ~keys; lastKeys = keys;
     if (gm.state == 0)
     {
-        if (!(down & 1) || facingIdx < 0) return false;
+        if (!(down & 1) || facingIdx < 0 || !fieldIdle(nds)) return false;
         gm = GhostMenu{}; gm.state = 1; gm.peer = std::string(peers[facingIdx].st.info.name, strnlen(peers[facingIdx].st.info.name, 8));
-        fprintf(stderr, "HGT: ghost-menu open (%s)\n", gm.peer.c_str()); if (glScreen) emu->osdAddMessage(0, "%s: Up/Down, A = choose, B = back", gm.peer.c_str());
+        fprintf(stderr, "HGT: ghost-menu open (%s)\n", gm.peer.c_str());
         return true;
     }
     if (gm.state == 1)
     {
         if (down & 64) gm.sel = (gm.sel + 2) % 3;
         if (down & 128) gm.sel = (gm.sel + 1) % 3;
-        if (glScreen && (down & 192)) emu->osdAddMessage(0, "> %s", gm.sel == 2 ? "Cancel" : gm.sel ? "Battle" : "Trade");
         if ((down & 2) || ((down & 1) && gm.sel == 2)) { gm.state = 0; fprintf(stderr, "HGT: ghost-menu dicht\n"); }
         else if ((down & 1) && gm.sel == 0 && partyCount(nds) < 2) { gm.state = 0; gmSay(emu, "You need 2 Pokemon to trade"); }
         else if (down & 1)
@@ -399,7 +403,7 @@ void menuTick(EmuInstance* emu, NDS& nds)   // na exchange: wie staat recht voor
         if (!memcmp(m.tag, "HGTQ", 4) && m.trainer >= 1 && m.trainer <= 2)
         {
             if (gm.state == 3 && gm.kind == (int)m.trainer) continue;   // elk bericht komt 3x (sendMsg)
-            if (gm.state || !HGTGhost::overworld(nds)) { sendMsg("HGTN", m.trainer); continue; }   // bezig: meteen nee
+            if (gm.state || !fieldIdle(nds)) { sendMsg("HGTN", m.trainer); continue; }   // bezig: meteen nee
             gm = GhostMenu{}; gm.state = 3; gm.kind = (int)m.trainer; gm.until = frame + kInviteFrames;
             gm.peer = peers.empty() ? std::string("friend") : std::string(peers[0].st.info.name, strnlen(peers[0].st.info.name, 8));
             gmSay(emu, gm.peer + " wants to " + kKind[gm.kind] + ". A = yes, B = no");
@@ -409,16 +413,32 @@ void menuTick(EmuInstance* emu, NDS& nds)   // na exchange: wie staat recht voor
     }
     if (gm.state >= 2 && frame >= gm.until) { if (gm.state == 3) sendMsg("HGTN", gm.kind); gm.state = 0; gmSay(emu, "No answer from " + gm.peer); }
 }
-void menuDraw(void* top)   // software-renderer: menu/vraag/melding rechtsboven op het bovenscherm (BGRA 256x192)
+QStringList menuLines()   // wat menu/vraag/melding nu tonen (leeg = niets)
 {
-    if (!gm.state && frame >= gmNoteUntil) return;
-    QImage img((uchar*)top, 256, 192, QImage::Format_RGB32); QPainter g(&img);
-    QFont f = g.font(); f.setPixelSize(10); g.setFont(f);
     QStringList lines;
     if (gm.state == 1) for (int i = 0; i < 3; i++) lines << QString("%1 %2").arg(i == gm.sel ? ">" : " ", i == 2 ? "Cancel" : i ? "Battle" : "Trade");
-    else if (gm.state == 2) lines << QString("Waiting for %1...").arg(QString::fromStdString(gm.peer)) << "(B: wait it out)";
+    else if (gm.state == 2) lines << QString("Waiting for %1...").arg(QString::fromStdString(gm.peer));
     else if (gm.state == 3) lines << QString("%1 wants to %2.").arg(QString::fromStdString(gm.peer), kKind[gm.kind]) << "A = yes   B = no";
-    else lines << QString::fromStdString(gmNote);
+    else if (frame < gmNoteUntil) lines << QString::fromStdString(gmNote);
+    return lines;
+}
+// OpenGL-renderer (geen CPU-framebuffer): dezelfde regels als één witte OSD-regel van melonDS, bij elke wijziging en elke 2,5 s
+// opnieuw (zo lang leeft een OSD-regel), zodat menu en vraag blijven staan zolang ze open zijn.
+void menuOsd(EmuInstance* emu)
+{
+    static QString last; static qint64 posted = 0;
+    QString t = menuLines().join("   ");
+    if (gm.state == 1) { t = QString::fromStdString(gm.peer) + ":"; for (int i = 0; i < 3; i++) { QString o = i == 2 ? "Cancel" : i ? "Battle" : "Trade"; t += i == gm.sel ? "  [" + o + "]" : "  " + o; } t += "   (A choose, B back)"; }
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (t.isEmpty()) { last.clear(); return; }
+    if (t == last && now - posted < 2500) return;
+    emu->osdAddMessage(0xFFFFFF, "%s", t.toUtf8().constData()); last = t; posted = now;
+}
+void menuDraw(void* top)   // software-renderer: menu/vraag/melding rechtsboven op het bovenscherm (BGRA 256x192)
+{
+    QStringList lines = menuLines(); if (lines.isEmpty()) return;
+    QImage img((uchar*)top, 256, 192, QImage::Format_RGB32); QPainter g(&img);
+    QFont f = g.font(); f.setPixelSize(10); g.setFont(f);
     int w = 0; for (auto& l : lines) w = std::max(w, g.fontMetrics().horizontalAdvance(l));
     QRect box(256 - w - 18, 4, w + 14, 8 + 12 * (int)lines.size());
     g.setPen(QPen(QColor(0x30, 0x30, 0x30), 2)); g.setBrush(QColor(0xf8, 0xf8, 0xf8)); g.drawRoundedRect(box, 3, 3);
@@ -693,7 +713,7 @@ void HGTogether::tick(EmuInstance* emu)
     void* top = nullptr; void* bottom = nullptr;
     bool cpu = nds.GPU.GetFramebuffers(&top, &bottom); if (!top) return;   // false = OpenGL: top = &GLuint van de uitvoertextuur
     if (haveMe) drawGhosts(top, cpu, nds);
-    glScreen = !cpu; if (cpu) menuDraw(top);
+    if (cpu) menuDraw(top); else menuOsd(emu);
     if (!cpu) return;
     u32* fb = (u32*)top;
     if (!dumpDir.empty() && frame % 60 == 0)
