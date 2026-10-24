@@ -19,6 +19,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdio>
 
@@ -111,6 +112,17 @@ bool overworld(NDS& nds)
     return !inRam(nds.ARM9Read32(pm + 4));
 }
 
+bool facingPeer(NDS& nds, int32_t x, int32_t z)
+{
+    if (!overworld(nds)) return false;
+    uint32_t fs = nds.ARM9Read32(nds.ARM9Read32(kFieldSysLiteral)), pa = nds.ARM9Read32(fs + 0x40), mo = inRam(pa) ? nds.ARM9Read32(pa + 0x30) : 0;
+    if (!inRam(mo)) return false;
+    int32_t mx = nds.ARM9Read32(mo + 0x64), mz = nds.ARM9Read32(mo + 0x6C), dir = nds.ARM9Read32(mo + 0x28);
+    if ((int32_t)nds.ARM9Read32(mo + 0x70) != (mx * 16 + 8) << 12 || (int32_t)nds.ARM9Read32(mo + 0x78) != (mz * 16 + 8) << 12) return false;   // midden op de tegel = stil
+    static const int dx[4] = {0, 0, -1, 1}, dz[4] = {-1, 1, 0, 0};   // richting 0 op, 1 neer, 2 links, 3 rechts
+    return dir >= 0 && dir < 4 && mx + dx[dir] == x && mz + dz[dir] == z;
+}
+
 void readInfo(NDS& nds, Info& i)
 {
     i.sprite = (int16_t)mySprite.load(); i.frames = (uint8_t)myFrames.load();
@@ -127,6 +139,8 @@ void readInfo(NDS& nds, Info& i)
 void draw(void* top, bool cpu, NDS& nds, int idx, const int32_t me[3], const int32_t pos[3], int facing, uint32_t frame, const Info& peer)
 {
     if (idx < 0 || idx >= 8) return;
+    static bool front[8]; bool f = facingPeer(nds, pos[0] >> 16, pos[2] >> 16);   // alleen log, voor emulator/test-face.sh
+    if (f != front[idx]) { front[idx] = f; fprintf(stderr, "HGT: ghost %d %s (%.8s)\n", idx, f ? "recht voor" : "niet meer recht voor", peer.name); }
     int32_t px = pos[0], pz = pos[2];
     // frame kiezen (hero-index): stilstaan / lopen A,B / rennen; zijwaarts = links, rechts gespiegeld
     static const uint8_t kStand[3] = {0, 21, 2}, kWalk[3][2] = {{20, 9}, {23, 22}, {3, 1}}, kRun[3][4] = {{7, 10, 7, 10}, {11, 12, 11, 12}, {15, 14, 16, 14}};
