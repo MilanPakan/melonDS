@@ -655,7 +655,7 @@ void decrypt(uint8_t* d, int len, uint32_t seed)
     }
 }
 
-bool readMon(NDS& nds, uint32_t a, Mon& m, bool* nicked = nullptr)
+bool readMon(NDS& nds, uint32_t a, Mon& m)
 {
     uint8_t raw[0xEC]; for (int i = 0; i < 0xEC; i++) raw[i] = nds.ARM9Read8(a + i);
     uint32_t pid; uint16_t flags, checksum; memcpy(&pid, raw, 4); memcpy(&flags, raw + 4, 2); memcpy(&checksum, raw + 6, 2);
@@ -668,7 +668,7 @@ bool readMon(NDS& nds, uint32_t a, Mon& m, bool* nicked = nullptr)
     auto blk = [&](int which) { return blocks + order[which] * 0x20; };
     memset(&m, 0, sizeof m); m.pid = pid;
     memcpy(&m.species, blk(0), 2);
-    uint32_t ivs; memcpy(&ivs, blk(1) + 0x10, 4); m.egg = (ivs >> 30) & 1; if (nicked) *nicked = ivs >> 31;   // block B +0x10: bit 31 hasNickname (as HGTNuzlocke)
+    uint32_t ivs; memcpy(&ivs, blk(1) + 0x10, 4); m.egg = (ivs >> 30) & 1;   // block B +0x10: bit 30 isEgg
     for (int i = 0; i < 10; i++) { uint16_t c; memcpy(&c, blk(2) + 2 * i, 2); if (c == 0xFFFF) break; m.nick[i] = HGTGhost::dsChar(c); }
     uint8_t party[0x64]; memcpy(party, raw + 0x88, 0x64); if (!(flags & 1)) decrypt(party, 0x64, pid);
     m.level = party[4]; memcpy(&m.hp, party + 6, 2); memcpy(&m.maxhp, party + 8, 2);
@@ -830,7 +830,6 @@ public:
 private:
     EmuInstance* emu; std::function<QString()> romPath; QTimer timer; QUdpSocket sock; QHostAddress peerHost; int peerPort = 0, port = 0, instance = 0;
     QString myName = "Player", peerName = "Friend", jsonPath; uint8_t johto = 0, kanto = 0; bool gameClear = false; uint32_t saveData = 0; int32_t mapId = -1;
-    bool nicked[6] = {};   // hasNickname per party slot, kept outside Mon (Mon is part of the HGSL packet)
     Mon mons[6]; int nMons = 0; bool partyBad = false; std::vector<Entry> log; Icons icons; Sprites sprites; Badges badges;
     int spriteMm = -1; uint8_t gender = 0; std::vector<QRect> spriteCells;   // chosen mmodel, -1 = game default
     // Nuzlocke state, read-only from <rom>.nuzlocke.json (HGTNuzlocke.cpp writes it: {"me"|"peer": {encs:[{area=mapsec, species, pid,
@@ -840,6 +839,9 @@ private:
     // Kyogre round 3: Soul Link partners that must go (area -1 = starter pair), corrupt party entries (only reported), switches.
     struct NzLink { uint32_t pid, partner; int area; bool missed; }; struct NzBad { uint32_t pid; int species, level, hp, maxhp; };
     std::vector<NzLink> nzLinked[2]; std::vector<NzBad> nzCorrupt; int nzSoulLink = -1, nzSameStarter = -1;
+    // Kyogre round 4, top-level and only while it applies: "cur" = running wild encounter {area, species, catch, reason ok|used|dupe|reroll},
+    // "nick" = last catch without a nickname {pid, species}. nzCurArea -1 / nzNickSpecies 0 = absent.
+    int nzCurArea = -1, nzCurSpecies = 0, nzNickSpecies = 0; bool nzCurCatch = true; QString nzCurReason;
     // View switch (docs/camera.md): diorama camera (HGT_CAM 30,45,1 unless HGT_CAM is set) and sharp view (OpenGL renderer at 4x).
     // Stored next to the ROM in <rom>.view as "diorama sharp" (0/1 each), applied at start; the launcher has no setting for it.
     bool viewDiorama = false, viewSharp = false; QRect dioramaRect, sharpRect;
@@ -885,12 +887,12 @@ private:
         uint32_t party = saveData + 0x10 + nds.ARM9Read32(hdr + 8), cur = nds.ARM9Read32(party + 4); if (cur > 6) return false;
         Mon tmp[6]; int n = 0;
         // party part has no checksum: a read mid-write gave Lv105 / HP 51119/17440 (playtest) -> drop it, as HGTNuzlocke's corrupt()
-        bool nk[6] = {}; uint32_t bad = 0, torn = 0;
-        for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, tmp[n], &nk[n])) torn++;
+        uint32_t bad = 0, torn = 0;
+        for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, tmp[n])) torn++;
             else { Mon& m = tmp[n]; if (m.egg || (m.level >= 1 && m.level <= 100 && m.maxhp && m.hp <= m.maxhp)) n++; else bad++; }
         if (!torn && (bad > 0) != partyBad) { partyBad = bad > 0; fprintf(stderr, "HGT: dock: party-lezing %s\n", bad ? "onzin (level/HP), vorige party blijft staan" : "weer goed"); }
         if (n != (int)cur) return false;   // torn read (emu thread mid-write) or nonsense: keep the last party, try again next tick
-        memcpy(mons, tmp, sizeof mons); memcpy(nicked, nk, sizeof nicked); nMons = n; return true;
+        memcpy(mons, tmp, sizeof mons); nMons = n; return true;
     }
 
     Entry* find(std::vector<Entry>& v, uint32_t pid) { for (auto& e : v) if (e.pid == pid) return &e; return nullptr; }
@@ -1165,6 +1167,9 @@ private:
         QString rom = romPath(); QFile f(rom + ".nuzlocke.json"); nzOn = !rom.isEmpty() && f.open(QIODevice::ReadOnly); if (!nzOn) return;
         QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); const char* keys[2] = {"me", "peer"};
         nzSoulLink = o.contains("soullink") ? o["soullink"].toBool() : -1; nzSameStarter = o.contains("sameStarter") ? o["sameStarter"].toBool() : -1;
+        QJsonObject cur = o["cur"].toObject(), nick = o["nick"].toObject();
+        nzCurArea = o.contains("cur") ? cur["area"].toInt(-1) : -1; nzCurSpecies = cur["species"].toInt(); nzCurCatch = cur["catch"].toBool(true); nzCurReason = cur["reason"].toString();
+        nzNickSpecies = o.contains("nick") ? nick["species"].toInt() : 0;
         for (int w = 0; w < 2; w++)
         {
             QJsonObject p = o[keys[w]].toObject(); nzEnc[w].clear(); nzDead[w].clear();
@@ -1460,9 +1465,6 @@ private:
         if (HGTNuzlocke::starterMismatch(stMine, stFriend)) acts.prepend(QString("▶ Turn order differs: you have starter setting %1, your friend %2. Restart both with the same join code.").arg(stMine).arg(stFriend));
         auto peers = HGTogether::peerStatus();   // ghost bridge, same source as the status line under the header
         if (std::none_of(peers.begin(), peers.end(), [](auto& p) { return p.connected; })) acts << QString("▶ %1 not connected.").arg(peers.empty() ? QString("Friend") : QString::fromStdString(peers[0].name));
-        // Nuzlocke rule (HGTNuzlocke logs "NICKNAME VERPLICHT"): every Pokémon in the party needs a nickname; without one the name
-        // field holds the species name, so that is what we show. Name Rater: Goldenrod City.
-        if (nzOn) for (int i = 0; i < nMons; i++) if (!mons[i].egg && !nicked[i]) acts << QString("▶ Give %1 a nickname (Name Rater).").arg(QString::fromLatin1(mons[i].nick));
         // Kyogre's watcher is the authority once its file exists: Soul Link partners that must go, corrupt entries, same starter
         auto nickOf = [&](uint32_t pid, bool peerSide) { Entry* e = find(peerSide ? peerLog : log, pid); if (e && e->nick[0]) return QString::fromLatin1(e->nick);
                                                          if (!peerSide) for (int i = 0; i < nMons; i++) if (mons[i].pid == pid) return QString::fromLatin1(mons[i].nick);
@@ -1476,6 +1478,13 @@ private:
             if (nzSameStarter == 1) acts << QString("▶ You both have the same starter.");
         }
         auto nameOf = [](const QStringList& l, int i) { return i < l.size() && !l[i].isEmpty() ? l[i] : QString("#%1").arg(i); };
+        if (nzOn && nzCurArea >= 0 && !nzCurCatch)   // running wild encounter that may not be caught (HGTNuzlocke "cur")
+        {
+            if (nzCurReason == "used") acts.prepend(QString("▶ Don't catch: %1 already used.").arg(mapsecName(nzCurArea)));
+            else if (nzCurReason == "reroll") acts.prepend(QString("▶ Dupe: run and try again (you may reroll)."));
+            else acts.prepend(QString("▶ Don't catch: %1 is a dupe.").arg(nameOf(speciesNames, nzCurSpecies)));
+        }
+        if (nzOn && nzNickSpecies) acts << QString("▶ Give %1 a nickname.").arg(nameOf(speciesNames, nzNickSpecies));   // last catch without one (HGTNuzlocke "nick")
         for (auto& l : learns) acts << (l.learned ? QString("✓ %1 learned %2.") : QString("▶ %1 could learn %2 (all 4 slots full, skipped).")).arg(nameOf(speciesNames, l.species), nameOf(moveNames, l.move));
         if (acts.isEmpty()) acts << "All pairs in order. Trainer battles allowed.";
         int tw = W - 36, ah = 0; QList<int> hs;
