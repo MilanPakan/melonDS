@@ -105,11 +105,12 @@ void storyStartAt(NDS& nds, int state)   // kopie van vars/flags; 1 = co-op (wac
     if (fb) { for (uint32_t i = 0; i < kFlagsBlk; i++) storySnap.push_back(nds.ARM9Read8(fb + i)); storyState = state; }
 }
 // Co-op alleen tegen bazen (Milan 2026-10-24): trainerklasse (byte 1 in trdata a/0/5/5, pokeheartgold trainer_class.h)
-// Rival, gymleiders (ook Blue), Elite Four, Champion Lance, Rocket-executives; rematches hebben dezelfde klasse. Rest solo.
+// Rival (ook 119 Passerby = 495-497, de rivaal in Cherrygrove als "???"), gymleiders (ook Blue), Elite Four, Champion Lance,
+// Rocket-executives; rematches hebben dezelfde klasse. Rest solo.
 HGTGhost::Narc trdata;
 bool isBoss(uint32_t t)
 {
-    static const uint8_t kBoss[] = { 23, 66, 67, 70, 72, 73, 74, 75, 76, 98, 103, 104, 105, 106, 107, 108, 110, 87, 88, 89, 112, 86, 114, 116, 117, 118 };
+    static const uint8_t kBoss[] = { 23, 119, 66, 67, 70, 72, 73, 74, 75, 76, 98, 103, 104, 105, 106, 107, 108, 110, 87, 88, 89, 112, 86, 114, 116, 117, 118 };
     uint32_t len = 0; const uint8_t* d = trdata.file((int)t, len); if (!d || len < 2) return false;
     for (uint8_t c : kBoss) if (d[1] == c) return true;
     return false;
@@ -455,8 +456,6 @@ void HGTogether::tick(EmuInstance* emu)
     bool online = !peers.empty() && frame - peers[0].seen < kPeerTimeout;
     const char* aa = getenv("HGT_AUTO_ACCEPT"); bool autoYes = aa && *aa && *aa != '0';   // tests/headless: altijd ja
     uint32_t t = hook ? nds.ARM9Read32(kSignal) : 0;
-    if (t & 0x80000000u)   // ROM: solo-battle zonder uitnodiging (trainer met 1 Pokémon): alleen story-sync
-    { nds.ARM9Write32(kSignal, 0); fprintf(stderr, "HGT: trainerbattle %u solo (1 Pokémon)\n", t & 0x7FFFFFFF); storyStart(3); t = 0; }
     if (t && !isBoss(t))   // gewone trainer: solo zonder uitnodiging (WAIT -> originele TrainerBattle), story-sync als bij solo
     { nds.ARM9Write32(kSignal, 0); nds.ARM9Write32(kDecision, 2); fprintf(stderr, "HGT: trainerbattle %u solo (geen baas)\n", t); storyStart(3); t = 0; }
     if (t)   // ROM-hook: trainerbattle van een baas, WAIT wacht op de beslissing
