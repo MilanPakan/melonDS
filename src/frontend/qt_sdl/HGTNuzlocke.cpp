@@ -59,7 +59,7 @@ bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr
 std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-thread) leest ze
 // calm: ARM9 wacht op vblank (spel niet midden in zijn werk)
 int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false, calm = false, partyDue = false; uint32_t calmTicks = 0, allTicks = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
-std::vector<uint32_t> pendingDead; uint32_t linkSetup = 0;   // doden in een linkbattle (co-op): pas definitief als die normaal eindigt
+std::vector<uint32_t> pendingDead; uint32_t linkSetup = 0, tid = 0;   // tid: trainer-ID+secret-ID van de run (anders = New Game)   // doden in een linkbattle (co-op): pas definitief als die normaal eindigt
 bool curEligible = false; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
@@ -244,7 +244,7 @@ Player fromJson(const QJsonObject& o)
 void save()
 {
     dirty = false; if (jsonPath.empty()) return;
-    QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}, {"soullink", soulLink != 0}};
+    QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}, {"soullink", soulLink != 0}, {"tid", (qint64)tid}};
     if (me.starterSpecies && peer.starterSpecies) o["sameStarter"] = family(me.starterSpecies) == family(peer.starterSpecies);   // dock: "jullie hebben dezelfde starter"
     if (peerStarter >= 0) { o["peerStarter"] = peerStarter.load(); o["starterMismatch"] = peerStarter != starterFirst; }
     QFile f(QString::fromStdString(jsonPath)); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(o).toJson());
@@ -255,6 +255,7 @@ void load()
     QJsonObject o = QJsonDocument::fromJson(f.readAll()).object(); me = fromJson(o["me"].toObject()); peer = fromJson(o["peer"].toObject());
     if (o.contains("starter")) starterFirst = o["starter"].toInt() ? 1 : 0;
     if (o.contains("soullink")) soulLink = o["soullink"].toBool() ? 1 : 0;
+    tid = (uint32_t)o["tid"].toDouble();
 }
 void exchange()
 {
@@ -285,6 +286,7 @@ void exchange()
             peerSoulLink = p.soulLink;
             if (p.soulLink != soulLink) nzlog("SOULLINK-MISMATCH: ik heb HGT_SOULLINK=%d, de vriend %d; Soul Link geldt pas als het gelijk is", soulLink, p.soulLink);
         }
+        if (p.nEncs == 0 && p.nDead == 0 && (!peer.encs.empty() || !peer.dead.empty())) nzlog("de vriend begint opnieuw: zijn staat hier gewist");
         Player q; q.starter = p.starterPid; q.starterSpecies = p.starterSpecies; q.encs.assign(p.encs, p.encs + p.nEncs); q.dead.assign(p.dead, p.dead + p.nDead); q.banned.assign(p.banned, p.banned + p.nBanned);
         q.nParty = p.nParty; memcpy(q.party, p.party, sizeof q.party); memcpy(q.partyPid, p.partyPid, sizeof q.partyPid); peerParty = true;
         if (q.encs.size() != peer.encs.size() || memcmp(q.encs.data(), peer.encs.data(), sizeof(Enc) * q.encs.size()) || q.dead != peer.dead || q.banned != peer.banned || q.starter != peer.starter || q.starterSpecies != peer.starterSpecies) dirty = true;
@@ -517,6 +519,12 @@ void HGTNuzlocke::tick(EmuInstance* emu)
     if (saveData)
     {
         uint32_t pd = saveArray(nds, 1); nds.ARM9Write16(pd, nds.ARM9Read16(pd) | 0x40);   // Options.battleStyle = Set
+        uint32_t id = nds.ARM9Read32(pd + 4 + 0x10);   // PlayerProfile.id (TID | SID << 16); een json zonder tid (oude run) neemt hem alleen over
+        if (id && id != tid)
+        {
+            if (tid) { nzlog("nieuw spel: staat gewist (trainer-ID %08X -> %08X, %zu encounters, %zu dood)", tid, id, me.encs.size(), me.dead.size()); me = Player{}; pendingDead.clear(); }
+            tid = id; dirty = true;
+        }
         johto = nds.ARM9Read8(pd + 4 + 0x1A); kanto = nds.ARM9Read8(pd + 4 + 0x1F); gameClear = nds.ARM9Read8(pd + 4 + 0x1D) & 1;
         if (fs) fieldSys = fs;
         watchEncounter(nds, fieldSys);   // de taakketen leeft in het FieldSystem, ook als de pointer tijdens de battle NULL is
