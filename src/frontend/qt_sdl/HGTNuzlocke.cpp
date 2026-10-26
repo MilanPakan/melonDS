@@ -52,7 +52,7 @@ struct Mon { uint32_t pid; uint16_t species; uint8_t level, egg, nicked, busy; u
 // party-deel onzin (level 0 of > 100, HP > max): niets afdwingen, alleen melden (playtest 2026-10-21: party-deel onversleuteld weggeschreven)
 bool corrupt(const Mon& m) { return !m.egg && (m.level == 0 || m.level > 100 || m.maxhp == 0 || m.hp > m.maxhp); }
 struct Link { uint32_t pid, partner; int32_t area; uint8_t cause, enforce; };   // Soul Link: mijn pid moet weg; cause 0 dood, 1 gemist, 2 partner in de box
-struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned; uint16_t party[6] = {}; uint32_t partyPid[6] = {}; uint8_t nParty = 0; uint32_t starter = 0; uint16_t starterSpecies = 0; std::vector<Link> linked; std::vector<Mon> corrupt; };
+struct Player { std::vector<Enc> encs; std::vector<uint32_t> dead, banned, got; uint16_t party[6] = {}; uint32_t partyPid[6] = {}; uint8_t nParty = 0; uint32_t starter = 0; uint16_t starterSpecies = 0; std::vector<Link> linked; std::vector<Mon> corrupt; };
 struct Packet { char magic[4]; uint8_t idx, nEncs, nDead, nBanned, nParty, starter, soulLink; uint32_t starterPid; uint16_t starterSpecies; uint16_t party[6]; uint32_t partyPid[6]; Enc encs[200]; uint32_t dead[64], banned[32]; };
 
 bool enabled = false, initDone = false; int sock = -1; sockaddr_storage peerAddr{}; socklen_t peerLen = 0;
@@ -60,6 +60,7 @@ std::atomic<int> peerStarter{-1}, mineStarter{0};   // atomics: het dock (GUI-th
 // calm: ARM9 wacht op vblank (spel niet midden in zijn werk)
 int myIdx = 0, starterFirst = 0, soulLink = 0, peerSoulLink = -1; bool peerParty = false, calm = false, partyDue = false; uint32_t calmTicks = 0, allTicks = 0; std::string jsonPath; uint32_t frame = 0, saveData = 0, fieldSys = 0, curSetup = 0, doneSetup = 0, curPid = 0;
 std::vector<uint32_t> pendingDead; uint32_t linkSetup = 0, tid = 0;   // tid: trainer-ID+secret-ID van de run (anders = New Game)   // doden in een linkbattle (co-op): pas definitief als die normaal eindigt
+std::vector<uint32_t> peerSeen; std::map<uint32_t, uint32_t> leftAt; uint32_t tradeBad = 0; uint16_t tradeSpecies = 0;   // ruil: pids ooit in de party van de vriend, frame waarop een pid mijn party verliet, laatste verboden ruil (dock)
 bool curEligible = false; const char* curReason = ""; uint16_t curSpecies = 0; uint32_t nickCheck = 0, nickRemind = 0; uint16_t nickSpecies = 0; uint32_t bagHidden = 0, bagCopy = 0, bagSnapSD = 0; uint8_t bagSnap[0x798]; bool bagHeld = false; int32_t curArea = -1; uint8_t johto = 0, kanto = 0; bool gameClear = false; bool dirty = false;
 Player me, peer;
 
@@ -109,6 +110,7 @@ int levelCap()
 // --- regels ---
 Enc* findEnc(Player& p, int32_t area) { for (auto& e : p.encs) if (e.area == area) return &e; return nullptr; }
 bool has(const std::vector<uint32_t>& v, uint32_t x) { return std::find(v.begin(), v.end(), x) != v.end(); }
+bool died(uint32_t pid) { return has(me.dead, pid) || has(peer.dead, pid); }   // na een ruil markeert de nieuwe eigenaar de dood
 // Evolutiefamilie per soort (basisvorm), gegenereerd met bench/families.py uit a/0/3/4 van Sacred Gold v1.05 (508 soorten).
 const uint16_t kFamily[508] = {
     0,1,1,1,4,4,4,7,7,7,10,10,10,13,13,13,16,16,16,19,
@@ -170,38 +172,49 @@ bool inParty(const Player& p, uint32_t pid) { for (int i = 0; i < p.nParty && i 
 std::vector<Link> pairs(const Player& a, const Player& b)
 {
     std::vector<Link> out;
-    for (auto& e : a.encs) if (e.outcome == CAUGHT && !has(a.dead, e.pid))
-        for (auto& f : b.encs) if (f.area == e.area && f.outcome == CAUGHT && !has(b.dead, f.pid)) out.push_back({e.pid, f.pid, e.area, 2, 0});
-    if (a.starter && b.starter && !has(a.dead, a.starter) && !has(b.dead, b.starter)) out.push_back({a.starter, b.starter, -1, 2, 0});
+    for (auto& e : a.encs) if (e.outcome == CAUGHT && !died(e.pid))
+        for (auto& f : b.encs) if (f.area == e.area && f.outcome == CAUGHT && !died(f.pid)) out.push_back({e.pid, f.pid, e.area, 2, 0});
+    if (a.starter && b.starter && !died(a.starter) && !died(b.starter)) out.push_back({a.starter, b.starter, -1, 2, 0});
     return out;
 }
 // Box-regel: alleen afdwingen op de overgang team -> box van de partner (gezien in deze sessie), anders kan een paar nooit meer terug in
 // het team: wie als eerste terughaalt zou meteen weer geboxt worden. Een verschil zonder die overgang staat alleen in de json (enforce false).
 std::map<uint32_t, bool> partnerSeenInTeam;
+// Na een paar-ruil heeft elk de helft van de ander: wat weg moet hoort bij wie hem in de party heeft (anders bij de vanger, in zijn box).
 std::vector<Link> links(const Player& a, const Player& b, bool mine)   // wat a kwijt moet door b
 {
     std::vector<Link> out; if (!soulLink || soulLink != peerSoulLink) return out;
-    for (auto& e : a.encs)
+    for (const Player* x : {&a, &b})
     {
-        if (e.outcome != CAUGHT || has(a.dead, e.pid)) continue;
-        for (auto& f : b.encs) if (f.area == e.area)
+        const Player& y = x == &a ? b : a;
+        auto lose = [&](Link l) { if (inParty(a, l.pid) || (x == &a && !inParty(b, l.pid))) out.push_back(l); };
+        for (auto& e : x->encs)
         {
-            if (f.outcome == CAUGHT && has(b.dead, f.pid)) out.push_back({e.pid, f.pid, e.area, 0, 1});
-            else if (f.outcome == MISSED) out.push_back({e.pid, 0, e.area, 1, 1});
+            if (e.outcome != CAUGHT || died(e.pid)) continue;
+            for (auto& f : y.encs) if (f.area == e.area)
+            {
+                if (f.outcome == CAUGHT && died(f.pid)) lose({e.pid, f.pid, e.area, 0, 1});
+                else if (f.outcome == MISSED) lose({e.pid, 0, e.area, 1, 1});
+            }
         }
+        if (x->starter && y.starter && !died(x->starter) && died(y.starter)) lose({x->starter, y.starter, -1, 0, 1});
     }
-    if (a.starter && b.starter && !has(a.dead, a.starter) && has(b.dead, b.starter)) out.push_back({a.starter, b.starter, -1, 0, 1});
     if (peerParty)
-        for (auto& l : pairs(a, b))
-            if (inParty(a, l.pid) && !inParty(b, l.partner)) { l.enforce = mine && partnerSeenInTeam[l.partner]; out.push_back(l); }
+        for (auto& l : pairs(a, b)) for (int s = 0; s < 2; s++)
+        {
+            uint32_t h = s ? l.partner : l.pid, o = s ? l.pid : l.partner;   // h in a's team, o (de andere helft) in geen enkel team
+            if (inParty(a, h) && !inParty(a, o) && !inParty(b, o)) out.push_back({h, o, l.area, 2, (uint8_t)(mine && partnerSeenInTeam[o])});
+        }
     return out;
 }
 void updateLinks()
 {
-    if (peerParty) for (auto& l : pairs(me, peer))
+    auto team = [](uint32_t pid) { return inParty(me, pid) || inParty(peer, pid); };
+    if (peerParty) for (auto& l : pairs(me, peer)) for (int s = 0; s < 2; s++)
     {
-        if (inParty(peer, l.partner)) partnerSeenInTeam[l.partner] = true;
-        else if (!inParty(me, l.pid)) partnerSeenInTeam[l.partner] = false;   // allebei in de box: regel voldaan, terughalen mag
+        uint32_t h = s ? l.partner : l.pid, o = s ? l.pid : l.partner;   // na een paar-ruil heeft de vriend mijn helft
+        if (inParty(peer, o)) partnerSeenInTeam[o] = true;
+        else if (!team(h)) partnerSeenInTeam[o] = false;   // allebei in de box: regel voldaan, terughalen mag
     }
     std::vector<Link> mine = links(me, peer, true);
     for (auto& l : mine)
@@ -230,7 +243,8 @@ QJsonObject toJson(const Player& p)
     for (auto& m : p.corrupt) bad.append(QJsonObject{{"pid", (qint64)m.pid}, {"species", m.species}, {"level", m.level}, {"hp", m.hp}, {"maxhp", m.maxhp}});
     QJsonArray linked;   // afgeleid (Soul Link), voor het dock: area -1 = het starter-paar
     for (auto& l : p.linked) linked.append(QJsonObject{{"pid", (qint64)l.pid}, {"partner", (qint64)l.partner}, {"area", l.area}, {"cause", l.cause == 2 ? "boxed" : l.cause ? "missed" : "dead"}, {"enforce", l.enforce != 0}});
-    return {{"encs", encs}, {"dead", dead}, {"banned", banned}, {"starter", (qint64)p.starter}, {"starterSpecies", p.starterSpecies}, {"linked", linked}, {"corrupt", bad}};
+    QJsonArray got; for (auto g : p.got) got.append((qint64)g);
+    return {{"encs", encs}, {"dead", dead}, {"banned", banned}, {"got", got}, {"starter", (qint64)p.starter}, {"starterSpecies", p.starterSpecies}, {"linked", linked}, {"corrupt", bad}};
 }
 Player fromJson(const QJsonObject& o)
 {
@@ -238,6 +252,7 @@ Player fromJson(const QJsonObject& o)
     for (auto v : o["encs"].toArray()) { QJsonObject e = v.toObject(); p.encs.push_back({e["area"].toInt(), (uint16_t)e["species"].toInt(), (uint32_t)e["pid"].toDouble(), (uint8_t)e["outcome"].toInt(), (int64_t)e["ts"].toDouble()}); }
     for (auto v : o["dead"].toArray()) p.dead.push_back((uint32_t)v.toDouble());
     for (auto v : o["banned"].toArray()) p.banned.push_back((uint32_t)v.toDouble());
+    for (auto v : o["got"].toArray()) p.got.push_back((uint32_t)v.toDouble());
     p.starter = (uint32_t)o["starter"].toDouble(); p.starterSpecies = (uint16_t)o["starterSpecies"].toInt();
     return p;
 }
@@ -247,6 +262,7 @@ void save()
     QJsonObject o{{"me", toJson(me)}, {"peer", toJson(peer)}, {"starter", starterFirst}, {"soullink", soulLink != 0}, {"tid", (qint64)tid}};
     if (me.starterSpecies && peer.starterSpecies) o["sameStarter"] = family(me.starterSpecies) == family(peer.starterSpecies);   // dock: "jullie hebben dezelfde starter"
     if (nickRemind) o["nick"] = QJsonObject{{"pid", (qint64)nickRemind}, {"species", nickSpecies}};   // dock: herinnering tot een bijnaam of de volgende encounter
+    if (tradeBad) o["trade"] = QJsonObject{{"pid", (qint64)tradeBad}, {"species", tradeSpecies}, {"reason", "pairs"}};   // dock: "Trade not allowed: only Soul Link pairs" tot de volgende encounter
     if (curSetup) o["cur"] = QJsonObject{{"area", curArea}, {"species", curSpecies}, {"catch", curEligible}, {"reason", curReason}};   // lopende wilde encounter (dock)
     if (peerStarter >= 0) { o["peerStarter"] = peerStarter.load(); o["starterMismatch"] = peerStarter != starterFirst; }
     QFile f(QString::fromStdString(jsonPath)); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(o).toJson());
@@ -394,14 +410,18 @@ void finish(uint32_t winFlag)   // winFlag: 1 win, 2 lose, 4 gevangen, 5 gevluch
 // gewonnen battle terug. Bij verlies (whiteout) heelt het spel de echte party, dus zonder deze lezing zou een dood daar onzichtbaar zijn.
 void watchBattleParty(NDS& nds, uint32_t setup)
 {
-    uint32_t party = nds.ARM9Read32(setup + 4), cur = inRam(party) ? nds.ARM9Read32(party + 4) : 0; if (cur > 6) return;
-    for (uint32_t i = 0; i < cur; i++)
+    // party[0..3] op +4: in een linkbattle staat de eigen party niet altijd op [0] (joiner: [0] = die van de leider), dus alleen eigen pids
+    for (uint32_t k = 0; k < 4; k++)
     {
-        Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
-        if (!m.species || m.hp || m.egg || m.busy || corrupt(m) || has(me.dead, m.pid) || has(pendingDead, m.pid)) continue;
-        // linkbattle: de setup-party komt pas bij het einde bij, maar de fork van doel A kan dan nog de savestate van vóór de co-op terugzetten
-        if (nds.ARM9Read32(setup) & 4) { pendingDead.push_back(m.pid); nzlog("DOOD (linkbattle, voorlopig tot het einde): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
-        else { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+        uint32_t party = nds.ARM9Read32(setup + 4 + k * 4), cur = inRam(party) ? nds.ARM9Read32(party + 4) : 0; if (cur > 6) continue;
+        for (uint32_t i = 0; i < cur; i++)
+        {
+            Mon m; if (!readMon(nds, party + 8 + i * 0xEC, m)) continue;
+            if (!m.species || m.hp || m.egg || m.busy || corrupt(m) || !inParty(me, m.pid) || has(me.dead, m.pid) || has(pendingDead, m.pid)) continue;
+            // linkbattle: de setup-party komt pas bij het einde bij, maar de fork van doel A kan dan nog de savestate van vóór de co-op terugzetten
+            if (nds.ARM9Read32(setup) & 4) { pendingDead.push_back(m.pid); nzlog("DOOD (linkbattle, voorlopig tot het einde): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+            else { me.dead.push_back(m.pid); dirty = true; nzlog("DOOD (in de battle): soort %u Lv%u pid %08X", m.species, m.level, m.pid); }
+        }
     }
 }
 void watchEncounter(NDS& nds, uint32_t fs)
@@ -434,7 +454,7 @@ void watchEncounter(NDS& nds, uint32_t fs)
     }
     if (nds.ARM9Read32(setup) & 1) { doneSetup = setup; return; }   // trainerbattle: geen Nuzlocke-encounter
     uint32_t enemy = nds.ARM9Read32(setup + 8); Mon wild; if (!inRam(enemy) || !readMon(nds, enemy + 8, wild)) return;
-    curSetup = setup; curPid = wild.pid; curArea = (int32_t)nds.ARM9Read32(setup + 0x154); curSpecies = wild.species; nickRemind = nickCheck = 0;
+    curSetup = setup; curPid = wild.pid; curArea = (int32_t)nds.ARM9Read32(setup + 0x154); curSpecies = wild.species; nickRemind = nickCheck = tradeBad = 0;
     Enc* e = findEnc(me, curArea);
     if (e && e->outcome != REROLL && e->outcome != PENDING) { curEligible = false; curReason = "used"; dirty = true; nzlog("encounter area %d soort %u: area al gebruikt, telt niet", curArea, wild.species); return; }
     bool dupe = owned(wild.species), second = firstPicker(curArea) != myIdx;
@@ -481,9 +501,23 @@ void watchParty(NDS& nds, uint32_t fs, bool idle)
     uint32_t party = saveArray(nds, 2), cur = nds.ARM9Read32(party + 4); if (cur > 6) return;
     Mon mons[6];
     for (uint32_t i = 0; i < cur; i++) if (!readMon(nds, party + 8 + i * 0xEC, mons[i])) return;   // half geschreven: volgende keer
+    for (int i = 0; i < me.nParty; i++) { bool still = false; for (uint32_t j = 0; j < cur; j++) still |= mons[j].pid == me.partyPid[i]; if (!still) leftAt[me.partyPid[i]] = frame; }
+    for (int i = 0; i < peer.nParty && i < 6; i++) if (!has(peerSeen, peer.partyPid[i])) peerSeen.push_back(peer.partyPid[i]);
     me.nParty = cur; for (uint32_t i = 0; i < 6; i++) { me.party[i] = i < cur ? mons[i].species : 0; me.partyPid[i] = i < cur ? mons[i].pid : 0; }
     if (!me.starter && me.encs.empty() && cur == 1 && !mons[0].egg) { me.starter = mons[0].pid; me.starterSpecies = mons[0].species; dirty = true; nzlog("starter: soort %u pid %08X (Soul Link-paar met de starter van de vriend)", mons[0].species, mons[0].pid); }
     for (uint32_t i = 0; i < cur; i++) if (mons[i].busy) return;   // spel heeft een record vast: deze tick niets beslissen of schrijven
+    // Soul Link: ruilen alleen met paren (Milan 2026-10-24): een Pokémon van de vriend mag alleen binnenkomen als de partner die ik net gaf
+    if (soulLink && soulLink == peerSoulLink)
+        for (uint32_t i = 0; i < cur; i++)
+        {
+            uint32_t y = mons[i].pid, x = 0; bool own = y == me.starter; for (auto& e : me.encs) own |= e.pid == y;
+            if (own || !has(peerSeen, y) || has(me.got, y) || has(me.banned, y)) continue;
+            for (auto& l : pairs(me, peer)) if (l.partner == y) x = l.pid;
+            bool ok = x && ((leftAt.count(x) && frame - leftAt[x] < 3600) || inParty(peer, x));
+            (ok ? me.got : me.banned).push_back(y); dirty = true;
+            if (!ok) { tradeBad = y; tradeSpecies = mons[i].species; }
+            nzlog(ok ? "ruil: soort %u pid %08X is de Soul Link-partner van mijn %08X: mag" : "RUIL VERBODEN (alleen Soul Link-paren): soort %u pid %08X, partner %08X niet gegeven: naar de box", mons[i].species, y, x);
+        }
     std::vector<Mon> bad; for (uint32_t i = 0; i < cur; i++) if (corrupt(mons[i])) bad.push_back(mons[i]);
     for (auto& m : bad)
     {
@@ -509,7 +543,7 @@ void watchParty(NDS& nds, uint32_t fs, bool idle)
     for (uint32_t i = 0; i < cur; i++)
     {
         if (corrupt(mons[i])) continue;   // gemeld hierboven; een bug mag geen run beëindigen
-        const char* why = has(me.dead, mons[i].pid) ? "dood" : has(me.banned, mons[i].pid) ? "verboden vangst" : linked(mons[i].pid) ? "Soul Link-partner weg" : (!league && !mons[i].egg && mons[i].level > cap) ? "boven de level cap" : nullptr;
+        const char* why = died(mons[i].pid) ? "dood" : has(me.banned, mons[i].pid) ? "verboden vangst" : linked(mons[i].pid) ? "Soul Link-partner weg" : (!league && !mons[i].egg && mons[i].level > cap) ? "boven de level cap" : nullptr;
         if (!why) continue;
         if (cur == 1) { if (frame % 600 == 0) nzlog("laatste Pokémon is %s: run voorbij", why); return; }
         nzlog("soort %u Lv%u pid %08X %s (cap %d)", mons[i].species, mons[i].level, mons[i].pid, why, cap);
